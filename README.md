@@ -4,7 +4,16 @@ A phone-installable web app (PWA) that splits songs into stems (vocals, drums, b
 
 - **Separate:** pick a song from your phone, and the app sends it to a Hugging Face Space running Demucs and downloads the stems.
 - **Library:** every split song is stored on the device (IndexedDB) and still plays when you're offline.
-- **Mixer:** play all stems in sync with mute, solo and volume per stem, slow down to 0.5× (pitch preserved), and loop.
+- **Mixer:** play all stems in sync with mute, solo and volume per stem.
+- **Practice:** set the speed from 50 to 150% in 5% steps without changing the pitch. Times show to a tenth of a second, and lock-screen and headphone controls work.
+- **A–B loops:**
+  - Tap *Set A* and then *Set B* while listening, and the loop starts right away.
+  - Drag the A/B flags on the waveform for rough placement. Then drag the zoomed waveform under the centre line to fine-tune to about 5 ms, or use the ±0.01 s and ±0.1 s buttons. *Check* plays the moment into A, or the moment up to B.
+  - Tap a time to type it exactly, as 1:23.45 or 1.23.45 (the phone's number pad has no colon).
+  - **Bars and tempo:** the app works out the BPM from the loop length. Type the song's BPM to lock it, so B sits exactly N bars after A. *Next* and *Prev* then step through the song one section at a time.
+  - Save named sections (Verse, Solo…). Speed, loops and mixer settings are remembered for each song.
+  - The waveform is drawn from the drums stem by default, because drum hits show where bars start.
+  - On a keyboard: Space plays and pauses, [ and ] set A and B, L toggles the loop, and Alt+←/→ nudges.
 - **Export:** render the mix as you've set it to a WAV file (for example the song without guitar for practice), or save or share any single stem.
 
 ## 1. Put it on GitHub Pages (5 minutes)

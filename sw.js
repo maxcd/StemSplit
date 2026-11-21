@@ -1,5 +1,5 @@
 // Offline support: caches the app shell so the library and mixer work without internet.
-const VERSION = "stemsplit-v1";
+const VERSION = "stemsplit-v2";
 const SHELL = [
   "./", "index.html", "styles.css", "app.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/icon-512-maskable.png", "icons/apple-touch-icon.png",

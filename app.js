@@ -467,13 +467,59 @@ async function openTrack(id) {
   await player.open(t);
 }
 
-/* ---------------- multitrack player ---------------- */
+/* ---------------- multitrack player + practice tools ---------------- */
+const PEAKS_PER_SEC = 200;              // waveform resolution: 5 ms per bin
+const ZOOMS = [1, 2, 5, 10];            // seconds visible in the fine-tune view
+const MIN_LOOP = 0.05;
+const COL_A = "#ffcf5a", COL_B = "#ff7a59";
+
+// m:ss.d (tenths) for the playhead, m:ss.cc (hundredths) for loop points
+function fmtT(s, d = 1) {
+  if (!isFinite(s) || s < 0) s = 0;
+  const f = 10 ** d;
+  const v = Math.floor(s * f + 1e-6) / f;
+  const m = Math.floor(v / 60);
+  return `${m}:${(v - m * 60).toFixed(d).padStart(d ? d + 3 : 2, "0")}`;
+}
+// accepts 1:23.45 · 83.45 · 1.23.45 (phone decimal keypad has no colon)
+function parseTime(str) {
+  str = String(str).trim().replace(/,/g, ".").replace(/\s+/g, "");
+  if (!str) return null;
+  let t;
+  if (str.includes(":")) {
+    const parts = str.split(":").map(Number);
+    t = parts.reduce((acc, v) => acc * 60 + v, 0);
+  } else {
+    const p = str.split(".");
+    t = p.length === 3 ? Number(p[0]) * 60 + Number(p[1] + "." + p[2]) : Number(str);
+  }
+  return isFinite(t) && t >= 0 ? t : null;
+}
+function prepCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+  }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { g, w, h };
+}
+const PRACTICE_DEFAULTS = {
+  rate: 1, loopOn: false, a: 0, b: null, active: "a", zoomIdx: 1,
+  bars: 4, bpb: 4, bpm: null, sections: [], waveKey: null,
+};
+
 const player = {
   ctx: null, track: null, stems: [], playing: false, raf: 0, saveT: 0,
+  p: { ...PRACTICE_DEFAULTS }, peaks: null, ovCache: null, stopAt: null, returnTo: null,
 
   async open(track) {
     this.close();
     this.track = track;
+    this.p = { ...PRACTICE_DEFAULTS, ...(track.practice || {}) };
+    this.p.sections = [...(this.p.sections || [])];
+    this.peaks = null; this.ovCache = null; this.stopAt = null;
     $("#plTitle").textContent = track.title;
     $("#plMeta").textContent = `${new Date(track.created).toLocaleString()} · via ${track.space}`;
     const mixer = $("#mixer");
@@ -494,19 +540,34 @@ const player = {
       const st = { meta: s, blob, url, audio, src, gain, vol: saved.vol ?? 1, mute: saved.mute ?? !!s.original, solo: saved.solo ?? false };
       this.stems.push(st);
       mixer.append(this.stemRow(st));
-      audio.addEventListener("loadedmetadata", () => this.updateTime());
+      audio.addEventListener("loadedmetadata", () => { this.refresh(); });
       audio.addEventListener("ended", () => { if (audio === this.master()) this.onEnded(); });
     }
-    $("#rate").value = "1";
-    this.applyGains();
-    this.updateTime();
+    // waveform source picker: drums are best for finding the start of a bar
+    const sel = $("#waveSrc");
+    sel.innerHTML = "";
+    for (const st of this.stems) sel.append(el("option", { value: st.meta.key, textContent: st.meta.name }));
+    const pick = this.stems.find((s) => s.meta.key === this.p.waveKey) ||
+      this.stems.find((s) => /drum|perc/i.test(s.meta.name)) ||
+      this.stems.find((s) => s.meta.original) || this.stems[0];
+    if (pick) { sel.value = pick.meta.key; this.loadPeaks(pick.meta.key); }
+    this.setRate(this.p.rate, false);
+    this.applyGains(false);
+    this.setupMediaSession();
+    this.refresh();
   },
 
+  /* ---- clock helpers ---- */
   master() {
-    // the longest track drives the clock
     return this.stems.reduce((a, s) => (!a || (s.audio.duration || 0) > (a.audio.duration || 0) ? s : a), null)?.audio;
   },
+  dur() { return this.master()?.duration || 0; },
+  now() { return this.master()?.currentTime || 0; },
+  A() { return Math.min(this.p.a || 0, Math.max(0, this.B() - MIN_LOOP)); },
+  B() { const d = this.dur(); return this.p.b == null ? d : Math.min(this.p.b, d || this.p.b); },
+  bpmLen() { return (this.p.bars * this.p.bpb * 60) / this.p.bpm; },
 
+  /* ---- mixer rows ---- */
   stemRow(st) {
     const c = colorFor(st.meta.name);
     const m = el("button", { className: "tbtn", textContent: "M", title: "Mute" });
@@ -522,13 +583,11 @@ const player = {
     save.onclick = () => shareBlob(st.blob, `${this.track.title} - ${st.meta.name}${extFor(st.blob)}`);
     return row;
   },
-
   audible(st) {
     const anySolo = this.stems.some((x) => x.solo);
     return anySolo ? st.solo : !st.mute;
   },
-
-  applyGains() {
+  applyGains(save = true) {
     for (const st of this.stems) {
       const on = this.audible(st);
       st.gain.gain.setTargetAtTime(on ? st.vol : 0, this.ctx.currentTime, 0.015);
@@ -536,79 +595,372 @@ const player = {
       st.mBtn.classList.toggle("on-m", st.mute);
       st.sBtn.classList.toggle("on-s", st.solo);
     }
-    clearTimeout(this.saveT);
-    this.saveT = setTimeout(() => this.persistMixer(), 600);
+    if (save) this.persistSoon();
   },
 
-  async persistMixer() {
+  /* ---- persistence ---- */
+  persistSoon() { clearTimeout(this.saveT); this.saveT = setTimeout(() => this.persist(), 500); },
+  async persist() {
     if (!this.track) return;
     this.track.mixer = Object.fromEntries(this.stems.map((s) => [s.meta.key, { vol: s.vol, mute: s.mute, solo: s.solo }]));
+    this.track.practice = { ...this.p };
     try { await db.putTrack(this.track); } catch {}
   },
 
-  async play() {
+  /* ---- transport ---- */
+  async play(fromAudition = false) {
     if (!this.stems.length) return;
     await this.ctx.resume();
-    const t = this.master().currentTime;
-    const rate = Number($("#rate").value);
-    this.stems.forEach((s) => { s.audio.currentTime = t; s.audio.playbackRate = rate; s.audio.preservesPitch = true; });
+    if (!fromAudition) {
+      this.stopAt = null;
+      const t = this.now();
+      if (this.p.loopOn && (t < this.A() - 0.01 || t >= this.B() - 0.02)) this.seek(this.A());
+    }
+    const t = this.now();
+    this.stems.forEach((s) => { s.audio.currentTime = t; s.audio.playbackRate = this.p.rate; s.audio.preservesPitch = true; s.audio.webkitPreservesPitch = true; });
     await Promise.all(this.stems.map((s) => s.audio.play().catch(() => {})));
     this.playing = true;
     $("#btnPlay").textContent = "❚❚";
+    if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
     this.loop();
   },
-
   pause() {
     this.stems.forEach((s) => s.audio.pause());
     this.playing = false;
     $("#btnPlay").textContent = "▶";
+    if (navigator.mediaSession) navigator.mediaSession.playbackState = "paused";
     cancelAnimationFrame(this.raf);
+    this.refresh();
   },
-
   seek(t) {
-    const d = this.master()?.duration || 0;
-    t = Math.max(0, Math.min(d, t));
+    const d = this.dur();
+    t = Math.max(0, Math.min(d || t, t));
     this.stems.forEach((s) => (s.audio.currentTime = Math.min(t, s.audio.duration || t)));
-    this.updateTime();
+    this.refresh();
   },
-
   loop() {
     cancelAnimationFrame(this.raf);
-    let last = 0;
+    let lastSync = 0;
     const tick = (now) => {
       if (!this.playing) return;
-      this.updateTime();
-      if (now - last > 400) { // drift correction
-        last = now;
-        const mt = this.master().currentTime;
+      const mt = this.now();
+      if (this.stopAt != null) {
+        if (mt >= this.stopAt) {
+          const back = this.returnTo;
+          this.stopAt = null;
+          this.pause();
+          if (back != null) this.seek(back);
+          return;
+        }
+      } else if (this.p.loopOn) {
+        const B = this.B();
+        // jump a hair early so the restart lands on A as cleanly as media elements allow
+        if (mt >= B - 0.012 * this.p.rate && B < this.dur() - 0.02) { this.seek(this.A()); lastSync = now; }
+      }
+      if (now - lastSync > 400) { // keep stems in sync
+        lastSync = now;
         for (const s of this.stems) {
           if (s.audio.ended || s.audio.currentTime >= (s.audio.duration || 0) - 0.05) continue;
           if (Math.abs(s.audio.currentTime - mt) > 0.07) s.audio.currentTime = mt;
         }
       }
+      this.refresh(true);
       this.raf = requestAnimationFrame(tick);
     };
     this.raf = requestAnimationFrame(tick);
   },
-
   onEnded() {
-    if ($("#loop").checked) { this.seek(0); this.play(); }
+    if (this.stopAt != null) { this.stopAt = null; this.pause(); if (this.returnTo != null) this.seek(this.returnTo); return; }
+    if (this.p.loopOn) { this.seek(this.A()); this.play(); }
     else { this.pause(); this.seek(0); }
   },
+  // short preview around the selected point: plays into A, or up to B
+  audition() {
+    const r = this.p.rate, span = 1.5 * r;
+    const isA = this.p.active === "a";
+    const from = isA ? this.A() : Math.max(0, this.B() - span);
+    const to = isA ? Math.min(this.dur(), this.A() + span) : this.B();
+    this.pause();
+    this.seek(from);
+    this.returnTo = from;
+    this.stopAt = to;
+    this.play(true);
+  },
+  setRate(r, save = true) {
+    r = Math.round(Math.max(0.5, Math.min(1.5, r)) * 20) / 20;
+    this.p.rate = r;
+    this.stems.forEach((s) => (s.audio.playbackRate = r));
+    $("#rate").value = r;
+    $("#spdVal").textContent = Math.round(r * 100) + "%";
+    if (save) this.persistSoon();
+  },
+  toggleLoop(on = !this.p.loopOn) {
+    this.p.loopOn = on;
+    this.refresh();
+    this.persistSoon();
+  },
 
-  updateTime() {
-    const m = this.master();
-    if (!m) return;
-    const d = m.duration || 0;
-    $("#tCur").textContent = fmtTime(m.currentTime);
-    $("#tDur").textContent = fmtTime(d);
-    if (!this.dragging) $("#seek").value = d ? Math.round((m.currentTime / d) * 1000) : 0;
+  /* ---- loop points ---- */
+  setActive(which) {
+    this.p.active = which;
+    this.refresh();
+  },
+  setPoint(which, t, { keepLock = false } = {}) {
+    const d = this.dur();
+    if (!d) return;
+    t = Math.max(0, Math.min(d, t));
+    if (which === "a") {
+      if (this.p.bpm) { // tempo locked: keep the exact bar length, B follows A
+        const len = this.bpmLen();
+        t = Math.min(t, Math.max(0, d - len));
+        this.p.a = t; this.p.b = Math.min(d, t + len);
+      } else {
+        this.p.a = Math.min(t, this.B() - MIN_LOOP);
+      }
+    } else {
+      if (!keepLock) this.p.bpm = null;
+      const b = Math.max(t, this.A() + MIN_LOOP);
+      this.p.b = b >= d - 0.001 ? null : b;
+    }
+    this.refresh();
+    this.persistSoon();
+  },
+  setHere(which) {
+    this.setActive(which);
+    this.setPoint(which, this.now());
+    if (which === "b") {
+      this.p.loopOn = true; // tap A … tap B → it starts looping right away
+      if (this.playing) this.seek(this.A());
+      this.refresh();
+    }
+  },
+  nudge(delta) { const w = this.p.active; this.setPoint(w, (w === "a" ? this.A() : this.B()) + delta); },
+  setBars(n) {
+    this.p.bars = Math.max(1, Math.min(64, n));
+    if (this.p.bpm) this.p.b = Math.min(this.dur(), this.A() + this.bpmLen());
+    this.refresh(); this.persistSoon();
+  },
+  setBpm(bpm) {
+    if (!bpm || bpm < 20 || bpm > 400) { this.p.bpm = null; this.refresh(); return; }
+    this.p.bpm = bpm;
+    const d = this.dur();
+    if (this.A() + this.bpmLen() > d) this.p.a = Math.max(0, d - this.bpmLen());
+    this.p.b = Math.min(d, this.A() + this.bpmLen());
+    this.refresh(); this.persistSoon();
+  },
+  shiftSection(dir) {
+    const a = this.A(), len = this.B() - a, d = this.dur();
+    const na = a + dir * len;
+    if (na < -0.001 || na + len > d + 0.001) return toast(dir < 0 ? "Already at the start" : "Already at the end");
+    this.p.a = Math.max(0, na); this.p.b = Math.min(d, na + len);
+    if (this.p.b >= d - 0.001) this.p.b = null;
+    this.p.loopOn = true;
+    this.seek(this.A());
+    this.persistSoon();
+  },
+  resetLoop() {
+    Object.assign(this.p, { a: 0, b: null, bpm: null, loopOn: false, active: "a" });
+    this.refresh(); this.persistSoon();
+  },
+  saveSection() {
+    const name = prompt("Name this section", `Section ${this.p.sections.length + 1}`);
+    if (!name) return;
+    this.p.sections.push({ name: name.trim(), a: this.A(), b: this.B(), bars: this.p.bars, bpb: this.p.bpb, bpm: this.p.bpm });
+    this.refresh(); this.persistSoon();
+  },
+  loadSection(i) {
+    const s = this.p.sections[i];
+    Object.assign(this.p, { a: s.a, b: s.b, bars: s.bars ?? this.p.bars, bpb: s.bpb ?? this.p.bpb, bpm: s.bpm ?? null, loopOn: true });
+    this.seek(this.A());
+    this.persistSoon();
+  },
+
+  /* ---- UI refresh ---- */
+  refresh(fast = false) {
+    const d = this.dur(), t = this.now();
+    $("#tCur").textContent = fmtT(t, 1);
+    $("#tDur").textContent = fmtT(d, 1);
+    this.drawOverview();
+    this.drawZoom();
+    if (fast) return;
+    const A = this.A(), B = this.B(), len = B - A;
+    $("#btnLoop").setAttribute("aria-pressed", String(this.p.loopOn));
+    $("#ptA").classList.toggle("active", this.p.active === "a");
+    $("#ptB").classList.toggle("active", this.p.active === "b");
+    if (!$("#tA").hidden) $("#tA").textContent = fmtT(A, 2);
+    if (!$("#tB").hidden) $("#tB").textContent = this.p.b == null ? `end ${fmtT(d, 1)}` : fmtT(B, 2);
+    $("#zoomPt").textContent = this.p.active.toUpperCase();
+    $("#btnZoom").textContent = `${ZOOMS[this.p.zoomIdx]} s view`;
+    $("#loopLen").textContent = d ? `${len.toFixed(2)} s${this.p.loopOn ? " · looping" : ""}` : "";
+    $("#barsVal").textContent = `${this.p.bars} bar${this.p.bars > 1 ? "s" : ""}`;
+    $("#bpb").value = String(this.p.bpb);
+    const implied = len > 0 ? (this.p.bars * this.p.bpb * 60) / len : 0;
+    if (document.activeElement !== $("#bpm")) $("#bpm").value = this.p.bpm ? String(+this.p.bpm.toFixed(2)) : implied ? implied.toFixed(1) : "";
+    $("#bpmLock").setAttribute("aria-pressed", String(!!this.p.bpm));
+    $("#bpmLock").textContent = this.p.bpm ? "🔒" : "🔓";
+    $("#bpmHint").textContent = this.p.bpm
+      ? `Tempo locked at ${+this.p.bpm.toFixed(2)} BPM: the loop is exactly ${this.p.bars} × ${this.p.bpb} beats. Move A and B follows; Next/Prev step by the same length.`
+      : "BPM is worked out from the loop length. Type the song's BPM to lock it: B then lands exactly that many bars after A.";
+    const box = $("#sections");
+    box.innerHTML = "";
+    this.p.sections.forEach((s, i) => {
+      const on = Math.abs(s.a - A) < 0.005 && Math.abs(s.b - B) < 0.005;
+      const x = el("span", { className: "x", textContent: "×" });
+      const chip = el("button", { className: "chip" + (on ? " on" : "") }, `${s.name} `, el("small", { textContent: fmtT(s.a, 1) }), x);
+      chip.onclick = (e) => {
+        if (e.target === x) { if (confirm(`Remove section "${s.name}"?`)) { this.p.sections.splice(i, 1); this.refresh(); this.persistSoon(); } return; }
+        this.loadSection(i);
+      };
+      box.append(chip);
+    });
+  },
+
+  /* ---- waveform ---- */
+  async loadPeaks(key) {
+    const st = this.stems.find((s) => s.meta.key === key);
+    if (!st) return;
+    this.p.waveKey = key;
+    const track = this.track;
+    track.peaks ||= {};
+    let pk = track.peaks[key];
+    if (!pk) {
+      try {
+        const buf = await this.ctx.decodeAudioData(await st.blob.arrayBuffer());
+        const n = Math.ceil(buf.duration * PEAKS_PER_SEC), hop = buf.sampleRate / PEAKS_PER_SEC;
+        pk = new Float32Array(n);
+        for (let c = 0; c < buf.numberOfChannels; c++) {
+          const data = buf.getChannelData(c);
+          for (let i = 0; i < n; i++) {
+            let m = pk[i];
+            const end = Math.min(data.length, Math.floor((i + 1) * hop));
+            for (let j = Math.floor(i * hop); j < end; j++) { const v = data[j] < 0 ? -data[j] : data[j]; if (v > m) m = v; }
+            pk[i] = m;
+          }
+        }
+        let max = 0;
+        for (const v of pk) if (v > max) max = v;
+        if (max > 0) for (let i = 0; i < n; i++) pk[i] = Math.pow(pk[i] / max, 0.7);
+        track.peaks[key] = pk;
+        this.persistSoon();
+      } catch (e) { console.warn("waveform failed", e); return; }
+    }
+    if (this.track !== track || this.p.waveKey !== key) return;
+    this.peaks = pk; this.ovCache = null;
+    this.refresh();
+  },
+  peakAt(i0, i1) {
+    const pk = this.peaks;
+    if (!pk) return 0;
+    i0 = Math.max(0, Math.floor(i0)); i1 = Math.min(pk.length, Math.max(i0 + 1, Math.ceil(i1)));
+    let m = 0;
+    for (let i = i0; i < i1; i++) if (pk[i] > m) m = pk[i];
+    return m;
+  },
+  drawOverview() {
+    const c = $("#overview");
+    if (!c.clientWidth) return;
+    const { g, w, h } = prepCanvas(c);
+    const d = this.dur();
+    g.clearRect(0, 0, w, h);
+    const x = (t) => (d ? (t / d) * w : 0);
+    // cached waveform columns
+    if (!this.ovCache || this.ovCache.w !== w || this.ovCache.peaks !== this.peaks || this.ovCache.d !== d) {
+      const cols = new Float32Array(Math.ceil(w));
+      if (this.peaks && d) for (let px = 0; px < w; px++) cols[px] = this.peakAt((px / w) * d * PEAKS_PER_SEC, ((px + 1) / w) * d * PEAKS_PER_SEC);
+      this.ovCache = { w, d, peaks: this.peaks, cols };
+    }
+    const cols = this.ovCache.cols, mid = h / 2 + 6, amp = (h - 16) / 2;
+    const A = this.A(), B = this.B(), xa = x(A), xb = x(B), xp = x(this.now());
+    if (d) { g.fillStyle = this.p.loopOn ? "rgba(124,156,255,.22)" : "rgba(124,156,255,.10)"; g.fillRect(xa, 12, xb - xa, h - 12); }
+    for (let px = 0; px < w; px++) {
+      const v = this.peaks ? Math.max(0.02, cols[px]) : 0.02;
+      g.fillStyle = px < xp ? "#7c9cff" : "#4a5162";
+      g.fillRect(px, mid - v * amp, 1, Math.max(1, v * amp * 2));
+    }
+    const handle = (xx, col, label, alignRight) => {
+      g.fillStyle = col;
+      g.fillRect(Math.round(xx) - 1, 10, 2, h - 10);
+      const bw = 16, bx = alignRight ? xx - bw : xx;
+      g.beginPath(); g.roundRect ? g.roundRect(Math.max(0, Math.min(w - bw, bx)), 0, bw, 14, 4) : g.rect(bx, 0, bw, 14); g.fill();
+      g.fillStyle = "#1a1a1a"; g.font = "bold 10px -apple-system, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle";
+      g.fillText(label, Math.max(0, Math.min(w - bw, bx)) + bw / 2, 7.5);
+    };
+    if (d) { handle(xa, COL_A, "A", false); handle(xb, COL_B, "B", true); }
+    g.fillStyle = "#fff";
+    g.fillRect(Math.round(xp) - 1, 12, 2, h - 12);
+  },
+  drawZoom() {
+    const c = $("#zoom");
+    if (!c.clientWidth) return;
+    const { g, w, h } = prepCanvas(c);
+    g.clearRect(0, 0, w, h);
+    const d = this.dur();
+    if (!d) return;
+    const W = ZOOMS[this.p.zoomIdx];
+    const isA = this.p.active === "a";
+    const center = isA ? this.A() : this.B();
+    const left = center - W / 2;
+    const x = (t) => ((t - left) / W) * w;
+    const A = this.A(), B = this.B();
+    // loop region
+    const ra = Math.max(0, x(A)), rb = Math.min(w, x(B));
+    if (rb > ra) { g.fillStyle = "rgba(124,156,255,.14)"; g.fillRect(ra, 0, rb - ra, h); }
+    // outside the song
+    g.fillStyle = "rgba(0,0,0,.35)";
+    if (x(0) > 0) g.fillRect(0, 0, x(0), h);
+    if (x(d) < w) g.fillRect(x(d), 0, w - x(d), h);
+    // ticks: every 0.1 s small, every 1 s tall with time label
+    const step = W <= 2 ? 0.1 : W <= 5 ? 0.5 : 1;
+    g.font = "10px -apple-system, sans-serif"; g.textBaseline = "top"; g.textAlign = "left";
+    for (let t = Math.ceil(left / step) * step; t < left + W; t += step) {
+      if (t < 0 || t > d) continue;
+      const whole = Math.abs(t - Math.round(t)) < 1e-6;
+      g.fillStyle = whole ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.14)";
+      const xx = Math.round(x(t));
+      g.fillRect(xx, h - (whole ? 14 : 7), 1, whole ? 14 : 7);
+      if (whole) { g.fillStyle = "rgba(255,255,255,.5)"; g.fillText(fmtT(t, 0), xx + 3, 2); }
+    }
+    // waveform
+    const mid = h / 2, amp = h / 2 - 14;
+    const binsPerPx = (W * PEAKS_PER_SEC) / w;
+    g.fillStyle = "#8f9bb8";
+    for (let px = 0; px < w; px++) {
+      const t = left + (px / w) * W;
+      if (t < 0 || t > d || !this.peaks) continue;
+      const v = Math.max(0.015, this.peakAt(t * PEAKS_PER_SEC, t * PEAKS_PER_SEC + binsPerPx));
+      g.fillRect(px, mid - v * amp, 1, Math.max(1, v * amp * 2));
+    }
+    if (!this.peaks) { g.fillStyle = "rgba(255,255,255,.4)"; g.textAlign = "center"; g.fillText("drawing waveform…", w / 2, mid - 5); }
+    // the other point, playhead, then the active point on top
+    const other = isA ? B : A;
+    if (x(other) >= 0 && x(other) <= w) { g.fillStyle = isA ? COL_B : COL_A; g.fillRect(Math.round(x(other)) - 1, 0, 2, h); }
+    const xp = x(this.now());
+    if (xp >= 0 && xp <= w) { g.fillStyle = "#fff"; g.fillRect(Math.round(xp), 0, 1, h); }
+    const col = isA ? COL_A : COL_B;
+    g.fillStyle = col;
+    g.fillRect(Math.round(w / 2) - 1, 0, 3, h);
+    g.beginPath(); g.moveTo(w / 2 - 7, 0); g.lineTo(w / 2 + 8, 0); g.lineTo(w / 2 + 0.5, 9); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(w / 2 - 7, h); g.lineTo(w / 2 + 8, h); g.lineTo(w / 2 + 0.5, h - 9); g.closePath(); g.fill();
+  },
+
+  /* ---- lock screen / headphone controls ---- */
+  setupMediaSession() {
+    const ms = navigator.mediaSession;
+    if (!ms) return;
+    try {
+      ms.metadata = new MediaMetadata({ title: this.track.title, artist: "StemSplit", artwork: [{ src: "icons/icon-512.png", sizes: "512x512", type: "image/png" }] });
+      ms.setActionHandler("play", () => this.play());
+      ms.setActionHandler("pause", () => this.pause());
+      ms.setActionHandler("seekbackward", () => this.seek(this.now() - 5));
+      ms.setActionHandler("seekforward", () => this.seek(this.now() + 5));
+      ms.setActionHandler("previoustrack", () => this.seek(this.A()));
+    } catch {}
   },
 
   close() {
     if (!this.stems.length) return;
     this.pause();
-    this.persistMixer();
+    this.persist();
     for (const s of this.stems) {
       s.audio.removeAttribute("src");
       s.audio.load();
@@ -641,13 +993,127 @@ const player = {
   },
 };
 
+/* ---- transport wiring ---- */
 $("#btnPlay").onclick = () => (player.playing ? player.pause() : player.play());
-$("#btnRew").onclick = () => player.seek((player.master()?.currentTime || 0) - 10);
-$("#btnFwd").onclick = () => player.seek((player.master()?.currentTime || 0) + 10);
-$("#rate").onchange = () => player.stems.forEach((s) => (s.audio.playbackRate = Number($("#rate").value)));
-const seekEl = $("#seek");
-seekEl.oninput = () => { player.dragging = true; const d = player.master()?.duration || 0; $("#tCur").textContent = fmtTime((seekEl.value / 1000) * d); };
-seekEl.onchange = () => { player.dragging = false; const d = player.master()?.duration || 0; player.seek((seekEl.value / 1000) * d); };
+$("#btnRew").onclick = () => player.seek(player.now() - 5);
+$("#btnFwd").onclick = () => player.seek(player.now() + 5);
+$("#btnToA").onclick = () => player.seek(player.p.loopOn || player.p.a ? player.A() : 0);
+$("#btnLoop").onclick = () => player.toggleLoop();
+$("#rate").oninput = () => player.setRate(Number($("#rate").value));
+$("#spdMinus").onclick = () => player.setRate(player.p.rate - 0.05);
+$("#spdPlus").onclick = () => player.setRate(player.p.rate + 0.05);
+$("#spdVal").onclick = () => player.setRate(1);
+
+/* ---- loop wiring ---- */
+$("#setA").onclick = (e) => { e.stopPropagation(); player.setHere("a"); };
+$("#setB").onclick = (e) => { e.stopPropagation(); player.setHere("b"); };
+$("#ptA").onclick = () => player.setActive("a");
+$("#ptB").onclick = () => player.setActive("b");
+document.querySelectorAll(".nudge [data-n]").forEach((b) => (b.onclick = () => player.nudge(Number(b.dataset.n))));
+$("#btnAudition").onclick = () => player.audition();
+$("#btnZoom").onclick = () => { player.p.zoomIdx = (player.p.zoomIdx + 1) % ZOOMS.length; player.refresh(); player.persistSoon(); };
+$("#barsMinus").onclick = () => player.setBars(player.p.bars - 1);
+$("#barsPlus").onclick = () => player.setBars(player.p.bars + 1);
+$("#bpb").onchange = () => { player.p.bpb = Number($("#bpb").value); player.setBars(player.p.bars); };
+$("#bpm").onchange = () => player.setBpm(Number($("#bpm").value.replace(",", ".")));
+$("#bpm").onkeydown = (e) => { if (e.key === "Enter") e.target.blur(); };
+$("#bpmLock").onclick = () => {
+  if (player.p.bpm) { player.p.bpm = null; player.refresh(); player.persistSoon(); }
+  else player.setBpm(Number($("#bpm").value.replace(",", ".")));
+};
+$("#btnPrevSec").onclick = () => player.shiftSection(-1);
+$("#btnNextSec").onclick = () => player.shiftSection(1);
+$("#btnSaveSection").onclick = () => player.saveSection();
+$("#btnClearLoop").onclick = () => player.resetLoop();
+$("#waveSrc").onchange = () => { player.peaks = null; player.loadPeaks($("#waveSrc").value); player.refresh(); };
+
+// tap a loop time to type an exact timestamp
+for (const which of ["a", "b"]) {
+  const btn = $(which === "a" ? "#tA" : "#tB");
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    player.setActive(which);
+    const inp = el("input", { className: "input num", value: fmtT(which === "a" ? player.A() : player.B(), 2), placeholder: "1:23.45" });
+    inp.setAttribute("inputmode", "decimal");
+    inp.setAttribute("enterkeyhint", "done");
+    btn.hidden = true;
+    btn.after(inp);
+    inp.focus(); inp.select();
+    let done = false;
+    const commit = (save) => {
+      if (done) return; done = true;
+      const t = save ? parseTime(inp.value) : null;
+      inp.remove(); btn.hidden = false;
+      if (t != null) player.setPoint(which, t);
+      else { if (save) toast("Use a time like 1:23.45 (or 1.23.45)"); player.refresh(); }
+    };
+    inp.onkeydown = (ev) => { if (ev.key === "Enter") commit(true); if (ev.key === "Escape") commit(false); };
+    inp.onblur = () => commit(true);
+    inp.onclick = (ev) => ev.stopPropagation();
+  };
+}
+
+// overview: tap to jump, drag the A/B flags to move them
+(() => {
+  const c = $("#overview");
+  let mode = null, lastSeek = 0;
+  const tAt = (e) => { const r = c.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * player.dur(); };
+  c.addEventListener("pointerdown", (e) => {
+    const d = player.dur(); if (!d) return;
+    c.setPointerCapture(e.pointerId);
+    const r = c.getBoundingClientRect(), xx = e.clientX - r.left;
+    const xa = (player.A() / d) * r.width, xb = (player.B() / d) * r.width;
+    const da = Math.abs(xx - xa), dbb = Math.abs(xx - xb), near = 22;
+    const inFlagRow = e.clientY - r.top < 26;
+    if ((da < near || dbb < near) && (inFlagRow || Math.min(da, dbb) < 12)) {
+      mode = da <= dbb ? "a" : "b";
+      player.setActive(mode);
+    } else { mode = "seek"; player.seek(tAt(e)); }
+  });
+  c.addEventListener("pointermove", (e) => {
+    if (!mode) return;
+    if (mode === "seek") { const n = performance.now(); if (n - lastSeek > 60) { lastSeek = n; player.seek(tAt(e)); } }
+    else player.setPoint(mode, tAt(e));
+  });
+  const end = (e) => { if (mode === "seek") player.seek(tAt(e)); mode = null; };
+  c.addEventListener("pointerup", end);
+  c.addEventListener("pointercancel", () => (mode = null));
+})();
+
+// fine-tune view: drag the waveform under the fixed centre line (like a jog wheel)
+(() => {
+  const c = $("#zoom");
+  let x0 = null, t0 = 0;
+  c.addEventListener("pointerdown", (e) => {
+    if (!player.dur()) return;
+    c.setPointerCapture(e.pointerId);
+    x0 = e.clientX;
+    t0 = player.p.active === "a" ? player.A() : player.B();
+  });
+  c.addEventListener("pointermove", (e) => {
+    if (x0 == null) return;
+    const W = ZOOMS[player.p.zoomIdx];
+    player.setPoint(player.p.active, t0 - ((e.clientX - x0) / c.clientWidth) * W, { keepLock: false });
+  });
+  const end = () => (x0 = null);
+  c.addEventListener("pointerup", end);
+  c.addEventListener("pointercancel", end);
+})();
+
+// keyboard (tablet / desktop): space play, [ ] set A/B, L loop, ←/→ nudge or seek
+document.addEventListener("keydown", (e) => {
+  if (!$("#view-player").classList.contains("active")) return;
+  if (/input|select|textarea/i.test(e.target.tagName)) return;
+  const k = e.key;
+  if (k === " ") { e.preventDefault(); player.playing ? player.pause() : player.play(); }
+  else if (k === "[") player.setHere("a");
+  else if (k === "]") player.setHere("b");
+  else if (k === "l" || k === "L") player.toggleLoop();
+  else if (k === "ArrowLeft") e.altKey ? player.nudge(e.shiftKey ? -0.1 : -0.01) : player.seek(player.now() - 5);
+  else if (k === "ArrowRight") e.altKey ? player.nudge(e.shiftKey ? 0.1 : 0.01) : player.seek(player.now() + 5);
+});
+addEventListener("resize", () => { player.ovCache = null; player.refresh(true); });
+
 $("#btnBack").onclick = () => show("library");
 $("#btnExportMix").onclick = () => player.exportMix().catch((e) => toast("Export failed: " + e.message, 5000));
 $("#btnRename").onclick = async () => {
