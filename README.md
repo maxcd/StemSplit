@@ -3,7 +3,9 @@
 A phone-installable web app (PWA) that splits songs into stems (vocals, drums, bass, guitar, piano, other) using a Hugging Face Space, and keeps every result in a library on your phone with a mute/solo/volume mixer.
 
 - **Separate:** pick a song from your phone, and the app sends it to a Hugging Face Space running Demucs and downloads the stems.
-- **Library:** every split song is stored on the device (IndexedDB) and still plays when you're offline.
+- **Library:** every song is stored on the device and still plays when you're offline. Stems are converted to 192 kbps MP3 on the phone (about 85% smaller than WAV), so a 4-minute song with 4 stems plus the original takes about 30–35 MB.
+- **Add without separating:** use Library → **＋ Add** for a plain song you only want to loop or slow down, for stems you already have (pick several files and choose "Stems of one song"), or for any .zip of audio files (one song per folder).
+- **Backup and moving to another device:** *Export song* (in the mixer) or *Export library* (in Settings) creates one .zip with the stems as normal MP3 files plus a `stemsplit.json` holding your loops, sections, speed and mixer settings. Save it to Files, iCloud or Drive, or AirDrop it, then import it on another device with ＋ Add. Importing the same backup twice skips songs that are already there.
 - **Mixer:** play all stems in sync with mute, solo and volume per stem.
 - **Practice:** set the speed from 50 to 150% in 5% steps without changing the pitch. Times show to a tenth of a second, and lock-screen and headphone controls work.
 - **A–B loops:**
@@ -46,7 +48,7 @@ Free CPU takes roughly 3–8 minutes for a 4-minute song. For speed you can swit
 ## Notes & limits
 
 - Keep the app open while a song is processing, because phones suspend web apps in the background. The app holds the screen awake where the browser supports it.
-- Your library stays on that phone in that browser. Deleting the home-screen app or clearing Safari website data deletes it too. On iPhone, the home-screen app and Safari have **separate** storage.
+- Your library stays on that phone, in that browser, until you export it. Deleting the home-screen app or clearing Safari website data deletes it too. On iPhone, the home-screen app and Safari have **separate** storage.
 - Stems from the included Space are 256 kbps MP3, about 8 MB per stem for a 4-minute song. Choose WAV in the options for lossless.
 - Your HF token is saved only in the browser on your phone (localStorage) and is sent only to Hugging Face.
 - Only separate music you have the rights to use.
@@ -58,4 +60,5 @@ Free CPU takes roughly 3–8 minutes for a 4-minute song. For speed you can swit
 | `index.html`, `styles.css`, `app.js` | the app |
 | `sw.js` | offline cache of the app shell |
 | `manifest.webmanifest`, `icons/` | home-screen install |
+| `mp3-worker.js`, `vendor/` | on-device MP3 encoding (lamejs, LGPL) and zip (fflate, MIT) |
 | `hf-space/` | optional: your own Demucs Space for Hugging Face |

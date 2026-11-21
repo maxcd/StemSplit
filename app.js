@@ -1,6 +1,8 @@
 // StemSplit: a phone-friendly front end for Hugging Face stem-separation Spaces,
 // with a local library (IndexedDB) and a multitrack stem mixer.
 
+import * as fflate from "./vendor/fflate.js";
+
 const GRADIO_CDN = "https://cdn.jsdelivr.net/npm/@gradio/client@2.8.0/dist/index.min.js";
 const GRADIO_CDN_FALLBACK = "https://esm.sh/@gradio/client@2.8.0";
 
@@ -51,6 +53,8 @@ const settings = {
   set space(v) { localStorage.setItem("ss.space", v.trim()); },
   get token() { return localStorage.getItem("ss.token") || ""; },
   set token(v) { v ? localStorage.setItem("ss.token", v.trim()) : localStorage.removeItem("ss.token"); },
+  get compress() { return localStorage.getItem("ss.compress") !== "0"; },
+  set compress(v) { localStorage.setItem("ss.compress", v ? "1" : "0"); },
   get keepOriginal() { return localStorage.getItem("ss.keepOrig") !== "0"; },
   set keepOriginal(v) { localStorage.setItem("ss.keepOrig", v ? "1" : "0"); },
   params(space) { try { return JSON.parse(localStorage.getItem("ss.params." + space) || "{}"); } catch { return {}; } },
@@ -341,8 +345,15 @@ $("#btnSeparate").onclick = async () => {
       setProgress({ text: outputs[i].name, frac: i / outputs.length });
       blobs.push(await fetchOutput(outputs[i].url));
     }
+    const stems = outputs.map((o, i) => ({ name: o.name, blob: blobs[i] }));
+    if (settings.keepOriginal) stems.push({ name: "Original mix", blob: chosenFile, original: true });
+    if (settings.compress) {
+      phase = "Shrinking to MP3…";
+      await compressStems(stems, (name, k, n, f) => setProgress({ text: `${name} (${k + 1}/${n})`, frac: (k + f) / n }));
+    }
+    phase = "Saving…";
     setProgress({ text: "Saving to library…", frac: 1 });
-    const id = await saveTrack(chosenFile, outputs, blobs, c.space);
+    const id = await createTrack({ title: chosenFile.name.replace(/\.[^.]+$/, ""), space: c.space, stems });
     finishUi();
     toast("Done! Saved to your library");
     resetChooser();
@@ -405,25 +416,6 @@ async function fetchOutput(url) {
   if ((!r || !r.ok) && settings.token) r = await fetch(url, { headers: { Authorization: `Bearer ${settings.token}` } });
   if (!r || !r.ok) throw new Error(`Couldn't download a stem (HTTP ${r?.status ?? "network error"})`);
   return r.blob();
-}
-
-async function saveTrack(file, outputs, blobs, space) {
-  const id = uid();
-  const title = file.name.replace(/\.[^.]+$/, "");
-  const entries = [];
-  const stems = outputs.map((o, i) => {
-    const key = `${id}:${i}`;
-    entries.push([key, blobs[i]]);
-    return { name: o.name, key, size: blobs[i].size, type: blobs[i].type || o.mime || "audio/wav" };
-  });
-  if (settings.keepOriginal) {
-    const key = `${id}:orig`;
-    entries.push([key, file]);
-    stems.push({ name: "Original mix", key, size: file.size, type: file.type || "audio/mpeg", original: true });
-  }
-  const track = { id, title, created: Date.now(), space, stems, mixer: {} };
-  await db.saveNew(track, entries);
-  return id;
 }
 
 /* ---------------- library ---------------- */
@@ -554,6 +546,7 @@ const player = {
     this.setRate(this.p.rate, false);
     this.applyGains(false);
     this.setupMediaSession();
+    $("#btnShrink").classList.toggle("hidden", !looksUncompressed(track));
     this.refresh();
   },
 
@@ -989,7 +982,7 @@ const player = {
     }
     const rendered = await off.startRendering();
     const label = active.length === this.stems.length ? "full mix" : active.map((s) => s.meta.name).join("+");
-    await shareBlob(encodeWav(rendered), `${this.track.title} (${label}).wav`);
+    await offerFile(encodeWav(rendered), `${this.track.title} (${label}).wav`, "Mix ready");
   },
 };
 
@@ -1173,11 +1166,346 @@ function encodeWav(buf) {
   return new Blob([out], { type: "audio/wav" });
 }
 
+/* ---------------- sheets: questions & progress ---------------- */
+function ask(title, text, options) {
+  return new Promise((res) => {
+    $("#modalTitle").textContent = title;
+    $("#modalText").textContent = text || "";
+    $("#modalBarWrap").classList.add("hidden");
+    const box = $("#modalBtns");
+    box.innerHTML = "";
+    for (const o of options) {
+      const b = el("button", { className: "btn " + (o.cls || ""), textContent: o.label });
+      b.onclick = () => { $("#modal").classList.add("hidden"); res(o.value); };
+      box.append(b);
+    }
+    $("#modal").classList.remove("hidden");
+  });
+}
+const busy = {
+  show(title, text = "", frac = null) {
+    $("#modalTitle").textContent = title;
+    $("#modalText").textContent = text;
+    $("#modalBtns").innerHTML = "";
+    const wrap = $("#modalBarWrap");
+    wrap.classList.remove("hidden");
+    wrap.classList.toggle("indeterminate", frac == null);
+    if (frac != null) $("#modalBar").style.width = Math.round(frac * 100) + "%";
+    $("#modal").classList.remove("hidden");
+  },
+  hide() { $("#modal").classList.add("hidden"); },
+};
+// Sharing needs a fresh tap (Safari rejects it after long work), so offer the file with a button.
+async function offerFile(blob, filename, title = "Ready") {
+  const ok = await ask(title, `${filename} · ${fmtBytes(blob.size)}`, [
+    { label: "Save / share", value: true, cls: "primary" },
+    { label: "Cancel", value: false, cls: "ghost" },
+  ]);
+  if (ok) await shareBlob(blob, filename);
+}
+
+/* ---------------- MP3 compression (on device) ---------------- */
+async function sniff(blob) {
+  const u = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+  const s = (a, b) => String.fromCharCode(...u.subarray(a, b));
+  if (s(0, 4) === "RIFF" && s(8, 12) === "WAVE") return "wav";
+  if (s(0, 4) === "FORM") return "aiff";
+  if (s(0, 4) === "fLaC") return "flac";
+  if (s(0, 3) === "ID3" || (u[0] === 0xff && (u[1] & 0xe0) === 0xe0)) return "mp3";
+  if (s(4, 8) === "ftyp") return "m4a";
+  if (s(0, 4) === "OggS") return "ogg";
+  return "other";
+}
+const needsCompress = async (blob) => ["wav", "aiff", "flac"].includes(await sniff(blob));
+function wavRate(ab) {
+  const u = new Uint8Array(ab, 0, Math.min(ab.byteLength, 8192));
+  const dv = new DataView(ab);
+  const id = (o) => String.fromCharCode(u[o], u[o + 1], u[o + 2], u[o + 3]);
+  if (id(0) !== "RIFF") return 44100;
+  for (let o = 12; o + 16 <= u.length; ) {
+    const size = dv.getUint32(o + 4, true);
+    if (id(o) === "fmt ") return dv.getUint32(o + 12, true);
+    o += 8 + size + (size & 1);
+  }
+  return 44100;
+}
+async function toMp3(blob, onProgress) {
+  const ab = await blob.arrayBuffer();
+  const sr = wavRate(ab);
+  const rate = [32000, 44100, 48000].includes(sr) ? sr : 44100;
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const buf = await new OAC(2, 1, rate).decodeAudioData(ab);
+  const left = buf.getChannelData(0).slice();
+  const right = (buf.numberOfChannels > 1 ? buf.getChannelData(1) : buf.getChannelData(0)).slice();
+  return new Promise((res, rej) => {
+    const w = new Worker("mp3-worker.js");
+    w.onmessage = (e) => {
+      if (e.data.progress != null) onProgress?.(e.data.progress);
+      else { w.terminate(); e.data.blob ? res(e.data.blob) : rej(new Error(e.data.error)); }
+    };
+    w.onerror = (e) => { w.terminate(); rej(new Error(e.message || "MP3 encoder failed")); };
+    w.postMessage({ left, right, sampleRate: buf.sampleRate, kbps: 192 }, [left.buffer, right.buffer]);
+  });
+}
+// stems: [{name, blob}] → compresses big formats in place, reports progress
+async function compressStems(stems, report) {
+  const todo = [];
+  for (const s of stems) if (await needsCompress(s.blob)) todo.push(s);
+  for (let k = 0; k < todo.length; k++) {
+    const s = todo[k];
+    try { s.blob = await toMp3(s.blob, (f) => report(s.name, k, todo.length, f)); }
+    catch (e) { console.warn("compress failed, keeping original", e); }
+  }
+}
+async function shrinkTrack(track, report) {
+  let saved = 0;
+  const list = [];
+  for (const s of track.stems) { const b = await db.getBlob(s.key); if (b && (await needsCompress(b))) list.push([s, b]); }
+  for (let k = 0; k < list.length; k++) {
+    const [s, b] = list[k];
+    const nb = await toMp3(b, (f) => report(s.name, k, list.length, f));
+    await db.tx(["blobs"], "readwrite", (t) => t.objectStore("blobs").put(nb, s.key));
+    saved += b.size - nb.size;
+    s.size = nb.size; s.type = nb.type;
+  }
+  await db.putTrack(track);
+  return saved;
+}
+const looksUncompressed = (t) => t.stems.some((s) => /wav|aiff|flac/i.test(s.type || ""));
+
+/* ---------------- creating library entries ---------------- */
+async function createTrack({ title, space = "", stems, practice = null, mixerByIndex = null, created = null }) {
+  const id = uid();
+  const entries = [], metas = [];
+  stems.forEach((s, i) => {
+    const key = `${id}:${i}`;
+    entries.push([key, s.blob]);
+    metas.push({ name: s.name, key, size: s.blob.size, type: s.blob.type || "audio/wav", original: !!s.original });
+  });
+  const mixer = {};
+  (mixerByIndex || []).forEach((m, i) => { if (m && metas[i]) mixer[metas[i].key] = m; });
+  const track = { id, title, created: created || Date.now(), space, stems: metas, mixer };
+  if (practice) {
+    const { waveIndex, ...rest } = practice;
+    track.practice = { ...rest, waveKey: waveIndex != null && waveIndex >= 0 ? metas[waveIndex]?.key ?? null : null };
+  }
+  await db.saveNew(track, entries);
+  return id;
+}
+
+const AUDIO_EXT = /\.(mp3|wav|flac|m4a|aac|ogg|opus|aiff?|wma)$/i;
+const baseName = (n) => n.replace(/^.*[\\/]/, "").replace(/\.[^.]+$/, "");
+function mimeFor(name) {
+  const e = (name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase();
+  return { mp3: "audio/mpeg", wav: "audio/wav", flac: "audio/flac", m4a: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", opus: "audio/ogg", aif: "audio/aiff", aiff: "audio/aiff" }[e] || "audio/mpeg";
+}
+function commonPrefix(names) {
+  if (names.length < 2) return "";
+  let p = names[0];
+  for (const n of names) while (!n.startsWith(p)) p = p.slice(0, -1);
+  return p;
+}
+const trimSep = (s) => s.replace(/^[\s\-_.()[\]]+|[\s\-_.([]+$/g, "");
+
+async function addAudioFiles(files, mode) {
+  const compress = settings.compress;
+  const report = (name, k, n, f) => busy.show("Shrinking to MP3…", `${name} (${k + 1}/${n})`, (k + f) / n);
+  if (mode === "stems") {
+    const names = files.map((f) => baseName(f.name));
+    const pre = commonPrefix(names);
+    let title = trimSep(pre) || names[0];
+    const stems = files.map((f, i) => ({ name: trimSep(names[i].slice(pre.length)) || names[i], blob: f }));
+    if (compress) await compressStems(stems, report);
+    busy.show("Saving…");
+    return [await createTrack({ title, stems })];
+  }
+  const ids = [];
+  for (const f of files) {
+    const stems = [{ name: "Full song", blob: f }];
+    if (compress) await compressStems(stems, report);
+    busy.show("Saving…", f.name);
+    ids.push(await createTrack({ title: baseName(f.name), stems }));
+  }
+  return ids;
+}
+
+$("#btnAddFiles").onclick = () => $("#addInput").click();
+$("#btnImport").onclick = () => $("#addInput").click();
+$("#btnJustLoop").onclick = () => { $("#addInput").click(); };
+$("#addInput").onchange = async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  if (!files.length) return;
+  const zips = files.filter((f) => /\.zip$/i.test(f.name) || /zip/.test(f.type));
+  const audio = files.filter((f) => !zips.includes(f));
+  let openId = null;
+  try {
+    for (const z of zips) await importZip(z);
+    if (audio.length === 1) openId = (await addAudioFiles(audio, "single"))[0];
+    else if (audio.length > 1) {
+      const mode = await ask(`${audio.length} audio files`, "How should they be added?", [
+        { label: "Stems of one song", value: "stems", cls: "primary" },
+        { label: `${audio.length} separate songs`, value: "songs" },
+        { label: "Cancel", value: null, cls: "ghost" },
+      ]);
+      if (mode) { const ids = await addAudioFiles(audio, mode); if (ids.length === 1) openId = ids[0]; else toast(`Added ${ids.length} songs`); }
+    }
+  } catch (err) {
+    console.error(err);
+    toast("Couldn't add: " + err.message, 6000);
+  }
+  busy.hide();
+  if (openId) { show("library"); openTrack(openId); }
+  else if ($("#view-library").classList.contains("active")) renderLibrary();
+  else if (zips.length) show("library");
+};
+
+/* ---------------- export / import (.zip) ---------------- */
+const safeName = (s) => (s || "untitled").replace(/[\\/:*?"<>|]+/g, "_").trim().slice(0, 80) || "untitled";
+
+async function buildZip(tracks) {
+  const parts = [];
+  let resolve, reject;
+  const finished = new Promise((r, j) => { resolve = r; reject = j; });
+  const zip = new fflate.Zip((err, chunk, final) => { if (err) return reject(err); parts.push(chunk); if (final) resolve(); });
+  const manifest = { format: "stemsplit", version: 1, exported: new Date().toISOString(), songs: [] };
+  const folders = new Set();
+  const total = tracks.reduce((a, t) => a + t.stems.length, 0);
+  let done = 0;
+  for (const t of tracks) {
+    let folder = safeName(t.title), n = 2;
+    while (folders.has(folder)) folder = `${safeName(t.title)} (${n++})`;
+    folders.add(folder);
+    const song = { title: t.title, created: t.created, space: t.space, stems: [], mixer: {}, practice: null };
+    const keyToFile = {};
+    const names = new Set();
+    for (const s of t.stems) {
+      busy.show("Packing backup…", `${t.title} · ${s.name}`, done++ / total);
+      const blob = await db.getBlob(s.key);
+      if (!blob) continue;
+      let fname = safeName(s.name), k = 2;
+      while (names.has(fname)) fname = `${safeName(s.name)} ${k++}`;
+      names.add(fname);
+      const file = `${folder}/${fname}${extFor(blob)}`;
+      const entry = new fflate.ZipPassThrough(file); // audio is already compressed: store as-is
+      zip.add(entry);
+      entry.push(new Uint8Array(await blob.arrayBuffer()), true);
+      keyToFile[s.key] = file;
+      song.stems.push({ name: s.name, file, type: blob.type, original: !!s.original });
+      if (t.mixer?.[s.key]) song.mixer[file] = t.mixer[s.key];
+    }
+    if (t.practice) {
+      const { waveKey, ...rest } = t.practice;
+      song.practice = { ...rest, waveFile: keyToFile[waveKey] || null };
+    }
+    manifest.songs.push(song);
+  }
+  const mf = new fflate.ZipPassThrough("stemsplit.json");
+  zip.add(mf);
+  mf.push(fflate.strToU8(JSON.stringify(manifest, null, 1)), true);
+  zip.end();
+  await finished;
+  return new Blob(parts, { type: "application/zip" });
+}
+
+async function exportTracks(tracks, filename) {
+  if (!tracks.length) return toast("Nothing to export yet");
+  const size = tracks.reduce((a, t) => a + t.stems.reduce((b, s) => b + (s.size || 0), 0), 0);
+  if (size > 700e6) {
+    const go = await ask("Large export", `This backup is about ${fmtBytes(size)}. Very large files can fail on phones. Shrinking to MP3 first, or exporting songs one at a time, is safer.`, [
+      { label: "Export anyway", value: true, cls: "primary" }, { label: "Cancel", value: false, cls: "ghost" }]);
+    if (!go) return;
+  }
+  try {
+    const blob = await buildZip(tracks);
+    await offerFile(blob, filename, "Backup ready");
+  } catch (e) {
+    busy.hide();
+    toast("Export failed: " + e.message, 6000);
+  }
+}
+
+async function importZip(file) {
+  busy.show("Importing…", file.name);
+  const data = new Uint8Array(await file.arrayBuffer());
+  const files = fflate.unzipSync(data, { filter: (f) => !f.name.startsWith("__MACOSX") && !f.name.endsWith("/") });
+  const existing = await db.allTracks();
+  const dup = (title, created) => existing.some((t) => t.title === title && t.created === created);
+  let added = 0, skipped = 0;
+  const mf = files["stemsplit.json"];
+  if (mf) {
+    const man = JSON.parse(fflate.strFromU8(mf));
+    for (const song of man.songs || []) {
+      if (dup(song.title, song.created)) { skipped++; continue; }
+      const present = (song.stems || []).filter((s) => files[s.file]);
+      if (!present.length) continue;
+      busy.show("Importing…", song.title, added / man.songs.length);
+      const stems = present.map((s) => ({ name: s.name, original: s.original, blob: new Blob([files[s.file]], { type: s.type || mimeFor(s.file) }) }));
+      let practice = null;
+      if (song.practice) {
+        const { waveFile, ...rest } = song.practice;
+        practice = { ...rest, waveIndex: present.findIndex((s) => s.file === waveFile) };
+      }
+      await createTrack({ title: song.title, created: song.created, space: song.space || "", stems, practice, mixerByIndex: present.map((s) => song.mixer?.[s.file]) });
+      added++;
+    }
+  } else {
+    // any zip of audio files: one song per folder
+    const groups = {};
+    for (const [path, u8] of Object.entries(files)) {
+      if (!AUDIO_EXT.test(path)) continue;
+      const parts = path.split("/");
+      const folder = parts.length > 1 ? parts[parts.length - 2] : baseName(file.name);
+      (groups[folder] ||= []).push({ path, u8 });
+    }
+    for (const [folder, list] of Object.entries(groups)) {
+      list.sort((a, b) => a.path.localeCompare(b.path));
+      const names = list.map((x) => baseName(x.path));
+      const pre = list.length > 1 ? commonPrefix(names) : "";
+      const stems = list.map((x, i) => ({ name: list.length === 1 ? "Full song" : trimSep(names[i].slice(pre.length)) || names[i], blob: new Blob([x.u8], { type: mimeFor(x.path) }) }));
+      if (settings.compress) await compressStems(stems, (name, k, n, f) => busy.show("Shrinking to MP3…", `${folder} · ${name}`, (k + f) / n));
+      await createTrack({ title: folder, stems });
+      added++;
+    }
+  }
+  busy.hide();
+  toast(`Imported ${added} song${added === 1 ? "" : "s"}${skipped ? ` · ${skipped} already in library` : ""}`, 4000);
+}
+
+$("#btnExportAll").onclick = async () => {
+  const tracks = (await db.allTracks()).sort((a, b) => a.created - b.created);
+  exportTracks(tracks, `StemSplit library ${new Date().toISOString().slice(0, 10)}.zip`);
+};
+$("#btnExportSong").onclick = () => exportTracks([player.track], `${safeName(player.track.title)} (StemSplit).zip`);
+$("#btnShrink").onclick = async () => {
+  const t = player.track;
+  player.close();
+  try {
+    const saved = await shrinkTrack(t, (name, k, n, f) => busy.show("Shrinking to MP3…", `${name} (${k + 1}/${n})`, (k + f) / n));
+    busy.hide();
+    toast(`Saved ${fmtBytes(saved)}`);
+  } catch (e) { busy.hide(); toast("Couldn't shrink: " + e.message, 5000); }
+  await player.open(await db.getTrack(t.id));
+};
+$("#btnShrinkAll").onclick = async () => {
+  const tracks = (await db.allTracks()).filter(looksUncompressed);
+  let saved = 0;
+  try {
+    for (let i = 0; i < tracks.length; i++)
+      saved += await shrinkTrack(tracks[i], (name, k, n, f) => busy.show(`Shrinking song ${i + 1} of ${tracks.length}…`, `${tracks[i].title} · ${name}`, (k + f) / n));
+  } catch (e) { toast("Stopped: " + e.message, 5000); }
+  busy.hide();
+  toast(`Saved ${fmtBytes(saved)}`);
+  fillSettings();
+};
+
 /* ---------------- settings view ---------------- */
 function fillSettings() {
   $("#spaceInput").value = settings.space;
   $("#tokenInput").value = settings.token;
   $("#keepOriginal").checked = settings.keepOriginal;
+  $("#compressStems").checked = settings.compress;
+  updateStorageDetail();
   const box = $("#spaceSuggestions");
   box.innerHTML = "";
   for (const s of SUGGESTED_SPACES) {
@@ -1196,6 +1524,7 @@ $("#btnSaveSettings").onclick = async () => {
   settings.space = space;
   settings.token = $("#tokenInput").value.trim();
   settings.keepOriginal = $("#keepOriginal").checked;
+  settings.compress = $("#compressStems").checked;
   conn = null;
   const msg = $("#settingsMsg");
   msg.style.color = "";
@@ -1211,6 +1540,19 @@ $("#btnSaveSettings").onclick = async () => {
     msg.textContent = "✗ " + friendlyError(e);
   }
 };
+
+$("#keepOriginal").onchange = () => (settings.keepOriginal = $("#keepOriginal").checked);
+$("#compressStems").onchange = () => (settings.compress = $("#compressStems").checked);
+
+async function updateStorageDetail() {
+  const tracks = await db.allTracks().catch(() => []);
+  const size = tracks.reduce((a, t) => a + t.stems.reduce((b, s) => b + (s.size || 0), 0), 0);
+  let txt = `${tracks.length} song${tracks.length === 1 ? "" : "s"} · ${fmtBytes(size)}.`;
+  if (navigator.storage?.estimate) { const { quota } = await navigator.storage.estimate(); if (quota) txt += ` Room for about ${fmtBytes(quota)}.`; }
+  if (navigator.storage?.persisted) txt += (await navigator.storage.persisted()) ? " Protected from automatic clean-up." : (window.matchMedia("(display-mode: standalone)").matches || navigator.standalone ? "" : " Install to your home screen so the browser keeps it.");
+  $("#storageDetail").textContent = txt;
+  $("#btnShrinkAll").classList.toggle("hidden", !tracks.some(looksUncompressed));
+}
 
 $("#btnWipe").onclick = async () => {
   if (!confirm("Delete ALL songs and stems from this phone? This can't be undone.")) return;

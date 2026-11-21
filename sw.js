@@ -1,8 +1,8 @@
 // Offline support: caches the app shell so the library and mixer work without internet.
-const VERSION = "stemsplit-v2";
+const VERSION = "stemsplit-v3";
 const SHELL = [
   "./", "index.html", "styles.css", "app.js", "manifest.webmanifest",
-  "icons/icon-192.png", "icons/icon-512.png", "icons/icon-512-maskable.png", "icons/apple-touch-icon.png",
+  "icons/icon-192.png", "icons/icon-512.png", "icons/icon-512-maskable.png", "icons/apple-touch-icon.png", "mp3-worker.js", "vendor/fflate.js", "vendor/lame.min.js",
 ];
 const CDN = "https://cdn.jsdelivr.net/npm/@gradio/client@2.8.0/dist/index.min.js";
 
