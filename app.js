@@ -251,6 +251,7 @@ let wakeLock = null;
 
 $("#fileInput").onchange = (e) => {
   chosenFile = e.target.files[0] || null;
+  if (chosenFile && !isAudio(chosenFile)) { toast("That doesn't look like an audio file"); chosenFile = null; e.target.value = ""; }
   $("#dzText").textContent = chosenFile ? chosenFile.name : "Tap to choose a song";
   $("#dropzone").classList.toggle("has-file", !!chosenFile);
   $("#btnSeparate").disabled = !chosenFile;
@@ -1329,15 +1330,44 @@ async function addAudioFiles(files, mode) {
   return ids;
 }
 
-$("#btnAddFiles").onclick = () => $("#addInput").click();
-$("#btnImport").onclick = () => $("#addInput").click();
-$("#btnJustLoop").onclick = () => { $("#addInput").click(); };
-$("#addInput").onchange = async (e) => {
+// The buttons are <label for="addInput">, so the browser opens the picker itself (no scripted click).
+// Keyboard users: Enter/Space on the label.
+for (const id of ["#btnAddFiles", "#btnImport", "#btnJustLoop"])
+  $(id).onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("#addInput").click(); } };
+$("#addInput").onchange = (e) => {
   const files = [...e.target.files];
   e.target.value = "";
+  handleAddFiles(files);
+};
+const isZip = (f) => /\.zip$/i.test(f.name) || /zip/.test(f.type);
+const isAudio = (f) => AUDIO_EXT.test(f.name) || /^audio\//.test(f.type);
+
+// drag & drop (desktop): drop on the Separate tab picks the song to split, anywhere else adds to the library
+let dragDepth = 0;
+addEventListener("dragenter", (e) => { if (e.dataTransfer?.types?.includes("Files")) { dragDepth++; document.body.classList.add("dragging"); } });
+addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+addEventListener("dragover", (e) => { if (e.dataTransfer?.types?.includes("Files")) e.preventDefault(); });
+addEventListener("drop", (e) => {
+  if (!e.dataTransfer?.files?.length) return;
+  e.preventDefault();
+  dragDepth = 0; document.body.classList.remove("dragging");
+  const files = [...e.dataTransfer.files];
+  if ($("#view-separate").classList.contains("active") && files.length === 1 && isAudio(files[0])) {
+    const dt = new DataTransfer(); dt.items.add(files[0]);
+    $("#fileInput").files = dt.files;
+    $("#fileInput").dispatchEvent(new Event("change"));
+    return;
+  }
+  handleAddFiles(files);
+});
+
+async function handleAddFiles(files) {
   if (!files.length) return;
-  const zips = files.filter((f) => /\.zip$/i.test(f.name) || /zip/.test(f.type));
-  const audio = files.filter((f) => !zips.includes(f));
+  const zips = files.filter(isZip);
+  const audio = files.filter((f) => !isZip(f) && isAudio(f));
+  const ignored = files.length - zips.length - audio.length;
+  if (ignored) toast(`Skipped ${ignored} file${ignored > 1 ? "s" : ""} that ${ignored > 1 ? "aren't" : "isn't"} audio or .zip`, 4000);
+  if (!zips.length && !audio.length) return;
   let openId = null;
   try {
     for (const z of zips) await importZip(z);
@@ -1358,7 +1388,7 @@ $("#addInput").onchange = async (e) => {
   if (openId) { show("library"); openTrack(openId); }
   else if ($("#view-library").classList.contains("active")) renderLibrary();
   else if (zips.length) show("library");
-};
+}
 
 /* ---------------- export / import (.zip) ---------------- */
 const safeName = (s) => (s || "untitled").replace(/[\\/:*?"<>|]+/g, "_").trim().slice(0, 80) || "untitled";
@@ -1574,7 +1604,15 @@ addEventListener("online", updateNet);
 addEventListener("offline", updateNet);
 updateNet();
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+const APP_VERSION = "4";
+$("#appVersion").textContent = `StemSplit version ${APP_VERSION}`;
+if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register("sw.js").then((r) => r.update()).catch(() => {});
+  // a newer version took over: offer a reload (never force it mid-practice)
+  navigator.serviceWorker.addEventListener("controllerchange", () => { if (hadController) $("#updateBadge").classList.remove("hidden"); });
+}
+$("#updateBadge").onclick = () => location.reload();
 navigator.storage?.persist?.().catch(() => {});
 
 document.addEventListener("visibilitychange", async () => {

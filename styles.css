@@ -182,3 +182,7 @@ main { padding: 16px; max-width: 680px; margin: 0 auto; }
 .sheet h3 { margin: 0 0 6px; font-size: 18px; }
 .modal-btns { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
 .modal-btns .btn { width: 100%; padding: 13px; }
+
+label.btn { display: inline-flex; align-items: center; justify-content: center; user-select: none; -webkit-user-select: none; }
+.badge.update { margin-left: auto; border: 0; background: var(--accent2); color: #fff; font: inherit; font-size: 12px; cursor: pointer; }
+body.dragging main { outline: 3px dashed var(--accent); outline-offset: -8px; border-radius: 16px; }

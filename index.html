@@ -19,6 +19,7 @@
   <header class="topbar">
     <h1 id="viewTitle">Separate</h1>
     <span id="netBadge" class="badge hidden">offline</span>
+    <button id="updateBadge" class="badge update hidden">Updated · tap to reload</button>
   </header>
 
   <main>
@@ -45,7 +46,7 @@
       <button class="btn primary big" id="btnSeparate" disabled>Separate stems</button>
       <div class="justloop">
         <span class="muted small">Only want to loop or slow down a song?</span>
-        <button class="btn ghost small" id="btnJustLoop">Add it without separating</button>
+        <label class="btn ghost small" id="btnJustLoop" for="addInput" role="button" tabindex="0">Add it without separating</label>
       </div>
 
       <div id="progress" class="card hidden">
@@ -64,7 +65,7 @@
     <section id="view-library" class="view">
       <div class="row gap libtop">
         <input type="search" id="libSearch" class="input" placeholder="Search your library">
-        <button class="btn" id="btnAddFiles">＋ Add</button>
+        <label class="btn" id="btnAddFiles" for="addInput" role="button" tabindex="0">＋ Add</label>
       </div>
       <input type="file" id="addInput" multiple hidden accept="audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.aiff,.zip,application/zip">
       <div id="libList"></div>
@@ -189,13 +190,14 @@
         <p class="small muted">iPhone (Safari): Share button → <em>Add to Home Screen</em>.<br>Android (Chrome): ⋮ menu → <em>Install app</em> / <em>Add to Home screen</em>.</p>
         <button class="btn hidden" id="btnInstall">Install app</button>
       </div>
+      <p class="muted small center" id="appVersion"></p>
       <div class="card">
         <strong>Library &amp; backup</strong>
         <p class="small muted" id="storageDetail">Your library is stored inside this app on this device.</p>
         <p class="small muted">A backup is one .zip with every song's stems, loops and mixer settings. Save it to Files, iCloud or Google Drive, or AirDrop it, then use <b>Import</b> (or Library → ＋ Add) on any device. The stems inside are ordinary audio files that any other app can open.</p>
         <div class="row gap wrap">
           <button class="btn" id="btnExportAll">Export library</button>
-          <button class="btn" id="btnImport">Import backup</button>
+          <label class="btn" id="btnImport" for="addInput" role="button" tabindex="0">Import backup</label>
           <button class="btn hidden" id="btnShrinkAll">Shrink all to MP3</button>
         </div>
         <button class="btn danger ghost" id="btnWipe" style="margin-top:12px">Delete entire library</button>
