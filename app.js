@@ -503,12 +503,13 @@ const METERS = { "2/4": 2, "3/4": 3, "4/4": 4, "5/4": 5, "6/4": 6, "7/4": 7, "6/
 const meterOf = (p) => (p.meter && METERS[p.meter] ? p.meter : `${p.bpb || 4}/4` in METERS ? `${p.bpb || 4}/4` : "4/4");
 const PRACTICE_DEFAULTS = {
   rate: 1, loopOn: false, a: 0, b: null, active: "a", zoomIdx: 1,
-  bars: 4, bpb: 4, bpm: null, sections: [], waveKey: null,
+  bars: 4, bpb: 4, bpm: null, sections: [], waveKey: null, countIn: "off", editOpen: true,
 };
 
 const player = {
   ctx: null, track: null, stems: [], playing: false, raf: 0, saveT: 0,
   p: { ...PRACTICE_DEFAULTS }, peaks: null, ovCache: null, stopAt: null, returnTo: null,
+  counting: false, countToken: 0, countTimers: [], clickNodes: [],
 
   async open(track) {
     this.close();
@@ -516,10 +517,11 @@ const player = {
     this.p = { ...PRACTICE_DEFAULTS, ...(track.practice || {}) };
     this.p.sections = [...(this.p.sections || [])];
     this.p.meter = meterOf(this.p);
+    if (this.p.countIn !== "off") this.p.countIn = "start"; // one toggle now: count in when play starts
     this.p.bpb = METERS[this.p.meter];
     this.peaks = null; this.ovCache = null; this.stopAt = null;
     $("#plTitle").textContent = track.title;
-    $("#plMeta").textContent = `${new Date(track.created).toLocaleString()} · via ${track.space}`;
+    $("#plMeta").textContent = new Date(track.created).toLocaleString() + (track.space ? ` · via ${track.space}` : "");
     const mixer = $("#mixer");
     mixer.innerHTML = "";
     this.ctx ||= new (window.AudioContext || window.webkitAudioContext)();
@@ -607,13 +609,20 @@ const player = {
   },
 
   /* ---- transport ---- */
-  async play(fromAudition = false) {
-    if (!this.stems.length) return;
+  async play({ audition = false, noCount = false } = {}) {
+    if (!this.stems.length || this.counting) return;
     await this.ctx.resume();
-    if (!fromAudition) {
+    if (!audition) {
       this.stopAt = null;
       const t = this.now();
       if (this.p.loopOn && (t < this.A() - 0.01 || t >= this.B() - 0.02)) this.seek(this.A());
+      if (!noCount && this.p.countIn !== "off") {
+        if (this.p.loopOn) this.seek(this.A()); // the count-in leads into the bar at A
+        this.counting = true;
+        const ok = await this.countIn();
+        this.counting = false;
+        if (!ok) return;
+      }
     }
     const t = this.now();
     this.stems.forEach((s) => { s.audio.currentTime = t; s.audio.playbackRate = this.p.rate; s.audio.preservesPitch = true; s.audio.webkitPreservesPitch = true; });
@@ -623,7 +632,46 @@ const player = {
     if (navigator.mediaSession) navigator.mediaSession.playbackState = "playing";
     this.loop();
   },
+  // tempo of the current loop: the locked BPM, or worked out from loop length and bars (only once a loop is set)
+  countBpm() {
+    if (this.p.bpm) return this.p.bpm;
+    const len = this.B() - this.A();
+    return this.p.b != null && len > 0 ? (this.p.bars * this.p.bpb * 60) / len : 0;
+  },
+  // one bar of clicks at the loop's tempo, scaled by the playback speed; resolves false if cancelled
+  countIn() {
+    const bpm = this.countBpm() * this.p.rate;
+    if (!(bpm >= 20 && bpm <= 400)) return Promise.resolve(true); // no sensible tempo: just start
+    const beats = Math.max(1, Math.round(this.p.bpb)), beat = 60 / bpm;
+    const token = ++this.countToken;
+    const now = this.ctx.currentTime, t0 = now + 0.08;
+    this.clickNodes = [];
+    for (let i = 0; i < beats; i++) {
+      const t = t0 + i * beat;
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.frequency.value = i === 0 ? 1600 : 1100; // accent on the one
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(i === 0 ? 0.7 : 0.45, t + 0.003);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+      o.connect(g).connect(this.ctx.destination);
+      o.start(t); o.stop(t + 0.09);
+      this.clickNodes.push(o);
+      this.countTimers.push(setTimeout(() => { if (token === this.countToken) $("#btnPlay").textContent = String(i + 1); }, (t - now) * 1000));
+    }
+    // media elements start a little late, so kick them off ~40 ms before the downbeat
+    const endMs = (t0 + beats * beat - now) * 1000 - 40;
+    return new Promise((res) => this.countTimers.push(setTimeout(() => res(token === this.countToken), Math.max(0, endMs))));
+  },
+  cancelCount() {
+    this.countToken++;
+    this.countTimers.forEach(clearTimeout);
+    this.countTimers = [];
+    this.clickNodes.forEach((o) => { try { o.stop(); } catch {} });
+    this.clickNodes = [];
+    this.counting = false;
+  },
   pause() {
+    this.cancelCount();
     this.stems.forEach((s) => s.audio.pause());
     this.playing = false;
     $("#btnPlay").textContent = "▶";
@@ -654,7 +702,10 @@ const player = {
       } else if (this.p.loopOn) {
         const B = this.B();
         // jump a hair early so the restart lands on A as cleanly as media elements allow
-        if (mt >= B - 0.012 * this.p.rate && B < this.dur() - 0.02) { this.seek(this.A()); lastSync = now; }
+        if (mt >= B - 0.012 * this.p.rate && B < this.dur() - 0.02) {
+          if (this.p.countIn === "every") { this.repeatWithCount(); return; }
+          this.seek(this.A()); lastSync = now;
+        }
       }
       if (now - lastSync > 400) { // keep stems in sync
         lastSync = now;
@@ -668,9 +719,16 @@ const player = {
     };
     this.raf = requestAnimationFrame(tick);
   },
+  repeatWithCount() {
+    this.stems.forEach((s) => s.audio.pause());
+    cancelAnimationFrame(this.raf);
+    this.playing = false;
+    this.seek(this.A());
+    this.play();
+  },
   onEnded() {
     if (this.stopAt != null) { this.stopAt = null; this.pause(); if (this.returnTo != null) this.seek(this.returnTo); return; }
-    if (this.p.loopOn) { this.seek(this.A()); this.play(); }
+    if (this.p.loopOn) { this.seek(this.A()); this.playing = false; this.play({ noCount: this.p.countIn !== "every" }); }
     else { this.pause(); this.seek(0); }
   },
   // short preview around the selected point: plays into A, or up to B
@@ -683,7 +741,7 @@ const player = {
     this.seek(from);
     this.returnTo = from;
     this.stopAt = to;
-    this.play(true);
+    this.play({ audition: true });
   },
   setRate(r, save = true) {
     r = Math.round(Math.max(0.5, Math.min(1.5, r)) * 20) / 20;
@@ -787,7 +845,7 @@ const player = {
     this.p.meter = meterOf({ meter: s.meter, bpb: this.p.bpb });
     this.p.bpb = METERS[this.p.meter];
     this.seek(this.A());
-    this.persistSoon();
+    this.persist();
   },
 
   /* ---- UI refresh ---- */
@@ -811,6 +869,13 @@ const player = {
     $("#bpb").value = this.p.meter;
     const implied = len > 0 ? (this.p.bars * this.p.bpb * 60) / len : 0;
     if (document.activeElement !== $("#bpm")) $("#bpm").value = this.p.bpm ? String(+this.p.bpm.toFixed(2)) : implied ? implied.toFixed(1) : "";
+    $("#btnCount").setAttribute("aria-pressed", String(this.p.countIn !== "off"));
+    const open = this.p.editOpen !== false;
+    $(".loopcard").classList.toggle("collapsed", !open);
+    $("#btnEditLoop").textContent = open ? "Done ▴" : "Edit ▾";
+    $("#btnEditLoop").setAttribute("aria-expanded", String(open));
+    $("#loopTitle").textContent = open ? "Loop section" : "Sections";
+    $("#noSections").classList.toggle("hidden", open || this.p.sections.length > 0);
     $("#bpmLock").setAttribute("aria-pressed", String(!!this.p.bpm));
     $("#bpmLock").textContent = this.p.bpm ? "🔒" : "🔓";
     $("#bpmLock").title = this.p.bpm ? "Tempo locked: B stays exactly the chosen bars after A. Tap to unlock." : "BPM is worked out from the loop. Type a BPM or tap to lock it.";
@@ -1008,7 +1073,12 @@ const player = {
 };
 
 /* ---- transport wiring ---- */
-$("#btnPlay").onclick = () => (player.playing ? player.pause() : player.play());
+$("#btnPlay").onclick = () => (player.playing || player.counting ? player.pause() : player.play());
+$("#btnEditLoop").onclick = () => { player.p.editOpen = player.p.editOpen === false; player.refresh(); player.persist(); };
+// save practice settings right away when the app is hidden or closed (phones may kill it without warning)
+addEventListener("pagehide", () => player.persist());
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") player.persist(); });
+$("#btnCount").onclick = () => { player.p.countIn = player.p.countIn === "off" ? "start" : "off"; player.refresh(); player.persistSoon(); };
 $("#btnRew").onclick = () => player.seek(player.now() - 5);
 $("#btnFwd").onclick = () => player.seek(player.now() + 5);
 $("#btnToA").onclick = () => player.seek(player.p.loopOn || player.p.a ? player.A() : 0);
@@ -1117,7 +1187,7 @@ document.addEventListener("keydown", (e) => {
   if (!$("#view-player").classList.contains("active")) return;
   if (/input|select|textarea/i.test(e.target.tagName)) return;
   const k = e.key;
-  if (k === " ") { e.preventDefault(); player.playing ? player.pause() : player.play(); }
+  if (k === " ") { e.preventDefault(); player.playing || player.counting ? player.pause() : player.play(); }
   else if (k === "[") player.setHere("a");
   else if (k === "]") player.setHere("b");
   else if (k === "l" || k === "L") player.toggleLoop();
@@ -1622,7 +1692,7 @@ addEventListener("online", updateNet);
 addEventListener("offline", updateNet);
 updateNet();
 
-const APP_VERSION = "6";
+const APP_VERSION = "9";
 $("#appVersion").textContent = `StemSplit version ${APP_VERSION}`;
 if ("serviceWorker" in navigator) {
   const hadController = !!navigator.serviceWorker.controller;

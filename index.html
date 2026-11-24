@@ -91,6 +91,9 @@
           <button class="btn round play" id="btnPlay" aria-label="Play">▶</button>
           <button class="btn round" id="btnFwd" aria-label="Forward 5 seconds">+5</button>
           <button class="btn round" id="btnLoop" aria-label="Loop" aria-pressed="false">⟲</button>
+          <button class="btn round" id="btnCount" aria-label="Count-in: one bar before playing" title="Count-in (one bar)" aria-pressed="false">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"><path d="M9 3h6l4 18H5z"/><path d="M7.2 15h9.6"/><path d="M12 15l5-9"/></svg>
+          </button>
         </div>
         <div class="speed">
           <span class="muted small">Speed</span>
@@ -102,10 +105,12 @@
       </div>
 
       <div class="card loopcard">
-        <div class="row between">
-          <strong>Loop section</strong>
+        <div class="loophead">
+          <strong id="loopTitle">Loop section</strong>
           <span id="loopLen" class="muted small num"></span>
+          <button class="btn small ghost" id="btnEditLoop" aria-expanded="true">Done ▴</button>
         </div>
+        <div id="loopEditor">
         <div class="ab">
           <div class="pt active" id="ptA" data-p="a">
             <div class="pt-h"><span class="pt-l">A</span><button class="pt-t num" id="tA">0:00.00</button></div>
@@ -144,7 +149,9 @@
           <button class="btn small" id="btnSaveSection">＋ Save section</button>
           <button class="btn small ghost" id="btnClearLoop">Reset loop</button>
         </div>
+        </div>
         <div id="sections" class="sections"></div>
+        <div id="noSections" class="muted small hidden">No saved sections yet. Tap <b>Edit</b> to set A and B and save some.</div>
       </div>
 
       <div id="mixer"></div>

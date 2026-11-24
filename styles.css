@@ -143,8 +143,9 @@ main { padding: 16px; max-width: 680px; margin: 0 auto; }
 .overview, .zoom { display: block; width: 100%; touch-action: none; border-radius: 10px; background: var(--bg); }
 .overview { height: 72px; }
 .zoom { height: 96px; margin-top: 12px; cursor: ew-resize; }
-.controls .btn.round { width: 52px; height: 52px; }
-.controls .btn.round.play { width: 66px; height: 66px; }
+.controls { gap: 8px; }
+.controls .btn.round { width: 46px; height: 46px; display: grid; place-items: center; }
+.controls .btn.round.play { width: 60px; height: 60px; }
 .btn[aria-pressed="true"] { background: var(--accent2); border-color: var(--accent2); color: #fff; }
 .btn.sq { width: 42px; height: 42px; padding: 0; font-size: 20px; flex: none; }
 .speed { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
@@ -208,3 +209,15 @@ body.dragging main { outline: 3px dashed var(--accent); outline-offset: -8px; bo
 .sec .nm small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .sec .x { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--muted); font-size: 18px; flex: none; }
 .sec .x:active { background: rgba(255,255,255,.08); }
+
+.countin { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.seg { flex: 1; display: grid; grid-template-columns: repeat(3, 1fr); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 3px; gap: 3px; }
+.seg button { height: 36px; border: 0; border-radius: 8px; background: none; color: var(--muted); font: inherit; font-size: 14px; font-weight: 600; }
+.seg button.on { background: var(--accent2); color: #fff; }
+
+.loophead { display: flex; align-items: center; gap: 10px; }
+.loophead strong { flex: none; }
+.loophead #loopLen { flex: 1; min-width: 0; }
+.loopcard.collapsed #loopEditor { display: none; }
+.loopcard.collapsed .sections { margin-top: 12px; }
+#noSections { margin-top: 10px; }
