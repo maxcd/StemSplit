@@ -117,8 +117,9 @@
           </div>
         </div>
         <canvas id="zoom" class="zoom" aria-label="Zoomed waveform. Drag sideways to fine-tune the selected point."></canvas>
-        <div class="row between small zoomhint">
-          <span class="muted">Drag the waveform to fine-tune <b id="zoomPt">A</b></span>
+        <div class="zoomhint">
+          <span class="muted small">Drag to fine-tune <b id="zoomPt">A</b></span>
+          <select id="waveSrc" class="input inline small" aria-label="Waveform from stem"></select>
           <button class="chip" id="btnZoom">2 s view</button>
         </div>
         <div class="nudge">
@@ -132,26 +133,18 @@
           <button class="btn sq" id="barsMinus" aria-label="Fewer bars">−</button>
           <span id="barsVal" class="num">4 bars</span>
           <button class="btn sq" id="barsPlus" aria-label="More bars">+</button>
-          <select id="bpb" class="input inline" aria-label="Beats per bar">
-            <option value="2">2/bar</option><option value="3">3/bar</option><option value="4" selected>4/bar</option>
-            <option value="5">5/bar</option><option value="6">6/bar</option><option value="7">7/bar</option>
+          <select id="bpb" class="input inline" aria-label="Time signature">
+            <option>2/4</option><option>3/4</option><option selected>4/4</option><option>5/4</option>
+            <option>6/4</option><option>7/4</option><option>6/8</option><option>12/8</option>
           </select>
-        </div>
-        <div class="tempo">
-          <span class="muted small">Tempo</span>
-          <input id="bpm" class="input inline num bpm" inputmode="decimal" aria-label="Tempo in BPM">
-          <span class="muted small">BPM</span>
+          <label class="bpmbox"><input id="bpm" class="num" inputmode="decimal" aria-label="Tempo in BPM"><span>bpm</span></label>
           <button class="btn sq lock" id="bpmLock" aria-pressed="false" title="Lock tempo">🔓</button>
         </div>
-        <div class="muted small" id="bpmHint">BPM is worked out from the loop length. Type the song's BPM to lock it: B then lands exactly that many bars after A.</div>
-        <div class="row gap wrap sectbtns">
-          <button class="btn small" id="btnPrevSec">⇤ Prev</button>
-          <button class="btn small" id="btnNextSec">Next ⇥</button>
-          <button class="btn small" id="btnSaveSection">＋ Save</button>
-          <button class="btn small ghost" id="btnClearLoop">Reset</button>
+        <div class="row gap sectbtns">
+          <button class="btn small" id="btnSaveSection">＋ Save section</button>
+          <button class="btn small ghost" id="btnClearLoop">Reset loop</button>
         </div>
-        <div id="sections" class="chips"></div>
-        <label class="muted small wavesrc">Waveform from <select id="waveSrc" class="input inline"></select></label>
+        <div id="sections" class="sections"></div>
       </div>
 
       <div id="mixer"></div>

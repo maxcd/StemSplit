@@ -498,6 +498,9 @@ function prepCanvas(c) {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { g, w, h };
 }
+// time signature → beats the BPM counts per bar (x/8 metres count dotted quarters, as musicians usually do)
+const METERS = { "2/4": 2, "3/4": 3, "4/4": 4, "5/4": 5, "6/4": 6, "7/4": 7, "6/8": 2, "12/8": 4 };
+const meterOf = (p) => (p.meter && METERS[p.meter] ? p.meter : `${p.bpb || 4}/4` in METERS ? `${p.bpb || 4}/4` : "4/4");
 const PRACTICE_DEFAULTS = {
   rate: 1, loopOn: false, a: 0, b: null, active: "a", zoomIdx: 1,
   bars: 4, bpb: 4, bpm: null, sections: [], waveKey: null,
@@ -512,6 +515,8 @@ const player = {
     this.track = track;
     this.p = { ...PRACTICE_DEFAULTS, ...(track.practice || {}) };
     this.p.sections = [...(this.p.sections || [])];
+    this.p.meter = meterOf(this.p);
+    this.p.bpb = METERS[this.p.meter];
     this.peaks = null; this.ovCache = null; this.stopAt = null;
     $("#plTitle").textContent = track.title;
     $("#plMeta").textContent = `${new Date(track.created).toLocaleString()} · via ${track.space}`;
@@ -699,6 +704,12 @@ const player = {
     this.p.active = which;
     this.refresh();
   },
+  // jump the playhead to a loop point; for B while looping, land 2 s before it so you hear B arrive
+  jumpTo(which) {
+    this.setActive(which);
+    if (which === "a") this.seek(this.A());
+    else this.seek(this.p.loopOn ? Math.max(this.A(), this.B() - 2 * this.p.rate) : this.B());
+  },
   setPoint(which, t, { keepLock = false } = {}) {
     const d = this.dur();
     if (!d) return;
@@ -708,13 +719,21 @@ const player = {
         const len = this.bpmLen();
         t = Math.min(t, Math.max(0, d - len));
         this.p.a = t; this.p.b = Math.min(d, t + len);
+      } else if (t > this.B() - MIN_LOOP) {
+        // A set past B: A goes exactly there, B is released to the end of the song
+        this.p.a = Math.min(t, d - MIN_LOOP);
+        this.p.b = null;
       } else {
-        this.p.a = Math.min(t, this.B() - MIN_LOOP);
+        this.p.a = t;
       }
     } else {
       if (!keepLock) this.p.bpm = null;
-      const b = Math.max(t, this.A() + MIN_LOOP);
-      this.p.b = b >= d - 0.001 ? null : b;
+      if (t < this.A() + MIN_LOOP) {
+        // B set before A: B goes exactly there, A is released to the start of the song
+        t = Math.max(t, MIN_LOOP);
+        this.p.a = 0;
+      }
+      this.p.b = t >= d - 0.001 ? null : t;
     }
     this.refresh();
     this.persistSoon();
@@ -759,12 +778,14 @@ const player = {
   saveSection() {
     const name = prompt("Name this section", `Section ${this.p.sections.length + 1}`);
     if (!name) return;
-    this.p.sections.push({ name: name.trim(), a: this.A(), b: this.B(), bars: this.p.bars, bpb: this.p.bpb, bpm: this.p.bpm });
+    this.p.sections.push({ name: name.trim(), a: this.A(), b: this.B(), bars: this.p.bars, bpb: this.p.bpb, meter: this.p.meter, bpm: this.p.bpm });
     this.refresh(); this.persistSoon();
   },
   loadSection(i) {
     const s = this.p.sections[i];
     Object.assign(this.p, { a: s.a, b: s.b, bars: s.bars ?? this.p.bars, bpb: s.bpb ?? this.p.bpb, bpm: s.bpm ?? null, loopOn: true });
+    this.p.meter = meterOf({ meter: s.meter, bpb: this.p.bpb });
+    this.p.bpb = METERS[this.p.meter];
     this.seek(this.A());
     this.persistSoon();
   },
@@ -787,25 +808,24 @@ const player = {
     $("#btnZoom").textContent = `${ZOOMS[this.p.zoomIdx]} s view`;
     $("#loopLen").textContent = d ? `${len.toFixed(2)} s${this.p.loopOn ? " · looping" : ""}` : "";
     $("#barsVal").textContent = `${this.p.bars} bar${this.p.bars > 1 ? "s" : ""}`;
-    $("#bpb").value = String(this.p.bpb);
+    $("#bpb").value = this.p.meter;
     const implied = len > 0 ? (this.p.bars * this.p.bpb * 60) / len : 0;
     if (document.activeElement !== $("#bpm")) $("#bpm").value = this.p.bpm ? String(+this.p.bpm.toFixed(2)) : implied ? implied.toFixed(1) : "";
     $("#bpmLock").setAttribute("aria-pressed", String(!!this.p.bpm));
     $("#bpmLock").textContent = this.p.bpm ? "🔒" : "🔓";
-    $("#bpmHint").textContent = this.p.bpm
-      ? `Tempo locked at ${+this.p.bpm.toFixed(2)} BPM: the loop is exactly ${this.p.bars} × ${this.p.bpb} beats. Move A and B follows; Next/Prev step by the same length.`
-      : "BPM is worked out from the loop length. Type the song's BPM to lock it: B then lands exactly that many bars after A.";
+    $("#bpmLock").title = this.p.bpm ? "Tempo locked: B stays exactly the chosen bars after A. Tap to unlock." : "BPM is worked out from the loop. Type a BPM or tap to lock it.";
     const box = $("#sections");
     box.innerHTML = "";
     this.p.sections.forEach((s, i) => {
       const on = Math.abs(s.a - A) < 0.005 && Math.abs(s.b - B) < 0.005;
-      const x = el("span", { className: "x", textContent: "×" });
-      const chip = el("button", { className: "chip" + (on ? " on" : "") }, `${s.name} `, el("small", { textContent: fmtT(s.a, 1) }), x);
-      chip.onclick = (e) => {
+      const x = el("span", { className: "x", textContent: "×", title: "Remove section" });
+      const card = el("button", { className: "sec" + (on ? " on" : "") },
+        el("span", { className: "nm" }, el("b", { textContent: s.name }), el("small", { textContent: `${fmtT(s.a, 1)} – ${fmtT(s.b, 1)}` })), x);
+      card.onclick = (e) => {
         if (e.target === x) { if (confirm(`Remove section "${s.name}"?`)) { this.p.sections.splice(i, 1); this.refresh(); this.persistSoon(); } return; }
         this.loadSection(i);
       };
-      box.append(chip);
+      box.append(card);
     });
   },
 
@@ -1001,22 +1021,20 @@ $("#spdVal").onclick = () => player.setRate(1);
 /* ---- loop wiring ---- */
 $("#setA").onclick = (e) => { e.stopPropagation(); player.setHere("a"); };
 $("#setB").onclick = (e) => { e.stopPropagation(); player.setHere("b"); };
-$("#ptA").onclick = () => player.setActive("a");
-$("#ptB").onclick = () => player.setActive("b");
+$("#ptA").onclick = () => player.jumpTo("a");
+$("#ptB").onclick = () => player.jumpTo("b");
 document.querySelectorAll(".nudge [data-n]").forEach((b) => (b.onclick = () => player.nudge(Number(b.dataset.n))));
 $("#btnAudition").onclick = () => player.audition();
 $("#btnZoom").onclick = () => { player.p.zoomIdx = (player.p.zoomIdx + 1) % ZOOMS.length; player.refresh(); player.persistSoon(); };
 $("#barsMinus").onclick = () => player.setBars(player.p.bars - 1);
 $("#barsPlus").onclick = () => player.setBars(player.p.bars + 1);
-$("#bpb").onchange = () => { player.p.bpb = Number($("#bpb").value); player.setBars(player.p.bars); };
+$("#bpb").onchange = () => { player.p.meter = $("#bpb").value; player.p.bpb = METERS[player.p.meter]; player.setBars(player.p.bars); };
 $("#bpm").onchange = () => player.setBpm(Number($("#bpm").value.replace(",", ".")));
 $("#bpm").onkeydown = (e) => { if (e.key === "Enter") e.target.blur(); };
 $("#bpmLock").onclick = () => {
   if (player.p.bpm) { player.p.bpm = null; player.refresh(); player.persistSoon(); }
   else player.setBpm(Number($("#bpm").value.replace(",", ".")));
 };
-$("#btnPrevSec").onclick = () => player.shiftSection(-1);
-$("#btnNextSec").onclick = () => player.shiftSection(1);
 $("#btnSaveSection").onclick = () => player.saveSection();
 $("#btnClearLoop").onclick = () => player.resetLoop();
 $("#waveSrc").onchange = () => { player.peaks = null; player.loadPeaks($("#waveSrc").value); player.refresh(); };
@@ -1026,7 +1044,7 @@ for (const which of ["a", "b"]) {
   const btn = $(which === "a" ? "#tA" : "#tB");
   btn.onclick = (e) => {
     e.stopPropagation();
-    player.setActive(which);
+    player.jumpTo(which);
     const inp = el("input", { className: "input num", value: fmtT(which === "a" ? player.A() : player.B(), 2), placeholder: "1:23.45" });
     inp.setAttribute("inputmode", "decimal");
     inp.setAttribute("enterkeyhint", "done");
@@ -1604,7 +1622,7 @@ addEventListener("online", updateNet);
 addEventListener("offline", updateNet);
 updateNet();
 
-const APP_VERSION = "4";
+const APP_VERSION = "6";
 $("#appVersion").textContent = `StemSplit version ${APP_VERSION}`;
 if ("serviceWorker" in navigator) {
   const hadController = !!navigator.serviceWorker.controller;

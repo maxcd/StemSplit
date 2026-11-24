@@ -186,3 +186,25 @@ main { padding: 16px; max-width: 680px; margin: 0 auto; }
 label.btn { display: inline-flex; align-items: center; justify-content: center; user-select: none; -webkit-user-select: none; }
 .badge.update { margin-left: auto; border: 0; background: var(--accent2); color: #fff; font: inherit; font-size: 12px; cursor: pointer; }
 body.dragging main { outline: 3px dashed var(--accent); outline-offset: -8px; border-radius: 16px; }
+
+/* ---- v6 layout ---- */
+.zoomhint { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.zoomhint > span { flex: 1; min-width: 0; }
+.zoomhint select { max-width: 110px; padding: 5px 6px; font-size: 13px; }
+.bars { flex-wrap: nowrap; gap: 6px; }
+.bars .btn.sq { width: 36px; height: 40px; font-size: 18px; }
+#barsVal { min-width: 50px; font-size: 15px; }
+.bars select { padding: 8px 4px; font-size: 15px; }
+.bpmbox { display: flex; align-items: center; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; height: 40px; flex: 1; min-width: 0; }
+.bpmbox input { width: 100%; min-width: 0; background: none; border: 0; color: var(--text); font: inherit; font-weight: 700; text-align: right; padding: 0 3px 0 0; }
+.bpmbox input:focus { outline: none; }
+.bpmbox span { color: var(--muted); font-size: 12px; }
+.bpmbox:focus-within { border-color: var(--accent); }
+.sections { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.sec { display: flex; align-items: center; gap: 6px; min-height: 52px; padding: 8px 10px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel2); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.sec.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.sec .nm { flex: 1; min-width: 0; }
+.sec .nm b { display: block; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sec .nm small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.sec .x { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--muted); font-size: 18px; flex: none; }
+.sec .x:active { background: rgba(255,255,255,.08); }
