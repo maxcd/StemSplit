@@ -21,7 +21,7 @@ import time
 import uuid
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 VERSION = 1
 MODELS = [
@@ -97,15 +97,18 @@ def encode(t, samplerate, fmt):
 
 
 def run_job(job):
-    import torch
-    from demucs.apply import apply_model, BagOfModels
-
     def update(**kw):
+        if "state" in kw and kw["state"] != job.get("state") or ("message" in kw and kw["message"] != job.get("message")):
+            print(time.strftime("%H:%M:%S"), f"job {job['id']}: {kw.get('message', kw.get('state'))}", flush=True)
         job.update(kw)
         job["updated"] = time.time()
 
     try:
-        update(state="loading", message="Loading model (first time: downloading, about 80 MB)…", progress=0)
+        update(state="loading", message="Starting Demucs…", progress=0)
+        import torch
+        from demucs.apply import apply_model, BagOfModels
+        first = job["model"] not in MODEL_CACHE
+        update(message="Loading model (first time: downloading it once)…" if first else "Loading model…")
         model = get_model(job["model"])
         n_models = len(model.models) if isinstance(model, BagOfModels) else 1
 
@@ -163,7 +166,10 @@ def worker():
         if job.get("cancel"):
             job.update(state="cancelled", message="Cancelled")
             continue
-        run_job(job)
+        try:
+            run_job(job)
+        except BaseException as e:  # never let the worker die: report and carry on
+            job.update(state="error", message=f"{type(e).__name__}: {e}", updated=time.time())
 
 
 def cleanup_loop():
@@ -250,7 +256,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "file missing or too large"}, 413)
         jid = uuid.uuid4().hex[:12]
         d = tempfile.mkdtemp(prefix=f"stemsplit-{jid}-")
-        name = os.path.basename(self.headers.get("X-Filename") or "song")
+        name = os.path.basename(unquote(self.headers.get("X-Filename") or "song"))
         ext = os.path.splitext(name)[1][:6] or ".audio"
         path = os.path.join(d, "input" + ext)
         with open(path, "wb") as f:
@@ -288,10 +294,15 @@ def main():
         print("WARNING: ffmpeg not found. MP3/M4A input may fail. Install it: sudo apt install ffmpeg")
     try:
         DEVICE = pick_device()
-    except ImportError:
-        raise SystemExit("PyTorch is not installed. See the README in this folder.")
+        import numpy, lameenc, demucs  # noqa: F401  (fail at start, not on the first song)
+    except ImportError as e:
+        raise SystemExit(f"Missing Python package ({e.name}). Fix:  rm -rf venv && bash start.sh")
+    except Exception:
+        raise SystemExit("PyTorch is not working. Delete the venv folder and run start.sh again:  rm -rf venv && bash start.sh")
 
     threading.Thread(target=worker, daemon=True).start()
+    # load the Demucs code in the background now, so the first song doesn't wait for it
+    threading.Thread(target=lambda: __import__("demucs.apply") and __import__("demucs.pretrained"), daemon=True).start()
     threading.Thread(target=cleanup_loop, daemon=True).start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"\n  StemSplit local engine is running on http://{args.host}:{args.port}  (device: {DEVICE})")
