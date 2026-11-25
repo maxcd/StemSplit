@@ -1,0 +1,7 @@
+# local engine: Python environment and caches (large, machine-specific)
+local-engine/venv/
+__pycache__/
+*.pyc
+# editor / OS clutter
+.DS_Store
+*.swp

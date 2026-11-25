@@ -221,3 +221,6 @@ body.dragging main { outline: 3px dashed var(--accent); outline-offset: -8px; bo
 .loopcard.collapsed #loopEditor { display: none; }
 .loopcard.collapsed .sections { margin-top: 12px; }
 #noSections { margin-top: 10px; }
+
+.seg.engine { margin: 6px 0 4px; grid-template-columns: 1fr 1fr; }
+#localSettings, #hfSettings { margin-top: 4px; }

@@ -171,6 +171,16 @@
     <!-- SETTINGS -->
     <section id="view-settings" class="view">
       <div class="card">
+        <label class="lbl">Separation engine</label>
+        <div class="seg engine" id="engineSeg" role="group" aria-label="Separation engine">
+          <button data-e="hf">Hugging Face</button><button data-e="local">This computer</button>
+        </div>
+        <div id="localSettings" class="hidden">
+          <label class="lbl" for="localUrl">Local engine address</label>
+          <input id="localUrl" class="input mono" placeholder="http://127.0.0.1:8765" autocapitalize="off" autocorrect="off" spellcheck="false">
+          <div class="muted small">Runs the separation on this computer: no upload, no daily limit. Start the local engine first (see the <b>local-engine</b> folder). Only works on the computer where it runs, not on your phone.</div>
+        </div>
+        <div id="hfSettings">
         <label class="lbl" for="spaceInput">Hugging Face Space</label>
         <input id="spaceInput" class="input mono" placeholder="owner/space-name" autocapitalize="off" autocorrect="off" spellcheck="false">
         <div class="muted small">Any Gradio Space that takes a song and returns audio stems. Some suggestions:</div>
@@ -178,6 +188,7 @@
         <label class="lbl" for="tokenInput">Hugging Face token (optional)</label>
         <input id="tokenInput" class="input mono" type="password" placeholder="hf_…" autocapitalize="off" autocorrect="off" spellcheck="false">
         <div class="muted small">Gives you a bigger free GPU quota on ZeroGPU Spaces and lets you use your own private Space. It's stored only on this device. A "read" token is enough.</div>
+        </div>
         <label class="chk"><input type="checkbox" id="keepOriginal" checked> Keep the original song in the library too</label>
         <label class="chk"><input type="checkbox" id="compressStems" checked> Store stems as MP3 (about 85% smaller than WAV)</label>
         <div class="row gap">

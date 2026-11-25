@@ -53,6 +53,10 @@ const settings = {
   set space(v) { localStorage.setItem("ss.space", v.trim()); },
   get token() { return localStorage.getItem("ss.token") || ""; },
   set token(v) { v ? localStorage.setItem("ss.token", v.trim()) : localStorage.removeItem("ss.token"); },
+  get engine() { return localStorage.getItem("ss.engine") === "local" ? "local" : "hf"; },
+  set engine(v) { localStorage.setItem("ss.engine", v); },
+  get localUrl() { return (localStorage.getItem("ss.localUrl") || "http://127.0.0.1:8765").replace(/\/+$/, ""); },
+  set localUrl(v) { v ? localStorage.setItem("ss.localUrl", v.trim()) : localStorage.removeItem("ss.localUrl"); },
   get compress() { return localStorage.getItem("ss.compress") !== "0"; },
   set compress(v) { localStorage.setItem("ss.compress", v ? "1" : "0"); },
   get keepOriginal() { return localStorage.getItem("ss.keepOrig") !== "0"; },
@@ -201,6 +205,7 @@ function describeParams(app, { endpoint, info, fileIdx }) {
 function renderParams() {
   const box = $("#paramBox");
   box.innerHTML = "";
+  if (settings.engine === "local") return renderLocalParams(box);
   $("#spaceLabel").textContent = settings.space;
   if (!conn) {
     box.append(el("div", { className: "muted small", textContent: "Connects to the Space when you start (or test it in Settings)." }));
@@ -244,6 +249,98 @@ function readParamValues() {
 }
 function saveParamValues() { if (conn) settings.saveParams(conn.space, readParamValues()); }
 
+/* ---------------- local engine (this computer) ---------------- */
+const LOCAL_DEFAULT_MODELS = [
+  { id: "htdemucs_6s", label: "6 stems: vocals, drums, bass, guitar, piano, other" },
+  { id: "htdemucs", label: "4 stems: vocals, drums, bass, other (fastest)" },
+  { id: "htdemucs_ft", label: "4 stems, best quality (about 4× slower)" },
+];
+const local = { info: null };
+const localErr = (msg) => Object.assign(new Error(msg), { local: true });
+
+async function localInfo() {
+  const base = settings.localUrl;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const r = await fetch(base + "/info", { signal: ctrl.signal });
+    if (!r.ok) throw new Error(r.status);
+    local.info = await r.json();
+    return local.info;
+  } catch {
+    local.info = null;
+    throw localErr(`Couldn't reach the local engine at ${base}.\n\nStart it on this computer with:\n  python3 stemsplit_local.py\n\nIf Chrome asks whether this site may access devices on your local network, allow it.`);
+  } finally { clearTimeout(t); }
+}
+
+function renderLocalParams(box) {
+  $("#spaceLabel").textContent = `This computer · ${settings.localUrl}`;
+  const models = local.info?.models || LOCAL_DEFAULT_MODELS;
+  const msel = el("select", { className: "input" });
+  for (const m of models) msel.append(el("option", { value: m.id, textContent: m.label }));
+  msel.value = localStorage.getItem("ss.local.model") || "htdemucs_6s";
+  if (msel.selectedIndex < 0) msel.selectedIndex = 0;
+  msel.onchange = () => localStorage.setItem("ss.local.model", msel.value);
+  const fsel = el("select", { className: "input" });
+  fsel.append(el("option", { value: "mp3", textContent: "MP3 (small)" }), el("option", { value: "wav", textContent: "WAV (lossless)" }));
+  fsel.value = localStorage.getItem("ss.local.format") || "mp3";
+  fsel.onchange = () => localStorage.setItem("ss.local.format", fsel.value);
+  box.append(el("label", { textContent: "Model" }), msel, el("label", { textContent: "Output format" }), fsel);
+  box.append(el("div", { className: "muted small", textContent: local.info
+    ? `Local engine ready (${String(local.info.device).toUpperCase()}).`
+    : "Local engine not reached yet. It must be running on this computer." }));
+}
+
+const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function runLocal(file, setPhase) {
+  const base = settings.localUrl;
+  setPhase("Connecting to this computer…");
+  await localInfo();
+  renderParams();
+  const model = localStorage.getItem("ss.local.model") || "htdemucs_6s";
+  const format = localStorage.getItem("ss.local.format") || "mp3";
+  setPhase("Sending song…");
+  setProgress({ text: `${file.name} → this computer`, frac: null });
+  let r;
+  try {
+    r = await fetch(`${base}/jobs?model=${encodeURIComponent(model)}&format=${format}`, {
+      method: "POST",
+      headers: { "X-Filename": encodeURIComponent(file.name), "Content-Type": file.type || "application/octet-stream" },
+      body: file,
+    });
+  } catch { throw localErr("The local engine stopped responding while sending the song."); }
+  const job = await r.json();
+  if (!r.ok) throw localErr(job.error || `Local engine error (${r.status})`);
+  const myJob = { cancel: () => fetch(`${base}/jobs/${job.id}`, { method: "DELETE" }).catch(() => {}) };
+  currentJob = myJob;
+  let s;
+  for (;;) {
+    await sleep(1000);
+    if (currentJob !== myJob) throw new Error("abort");
+    try { s = await (await fetch(`${base}/jobs/${job.id}`)).json(); }
+    catch { throw localErr("Lost the connection to the local engine. Is it still running?"); }
+    if (s.state === "queued") { setPhase(s.position ? `Waiting (#${s.position + 1})` : "Starting…"); setProgress({ text: "", frac: null }); }
+    else if (s.state === "loading") { setPhase("Preparing…"); setProgress({ text: s.message, frac: null }); }
+    else if (s.state === "separating") { setPhase("Separating…"); setProgress({ text: s.message, frac: s.progress }); }
+    else if (s.state === "encoding") { setPhase("Saving stems…"); setProgress({ text: s.message, frac: 1 }); }
+    else if (s.state === "done") break;
+    else if (s.state === "cancelled") throw new Error("abort");
+    else if (s.state === "error") throw localErr(s.message || "The local engine reported an error.");
+  }
+  setPhase("Fetching stems…");
+  const stems = [];
+  for (let i = 0; i < s.stems.length; i++) {
+    const st = s.stems[i];
+    setProgress({ text: st.name, frac: i / s.stems.length });
+    const res = await fetch(base + st.url);
+    if (!res.ok) throw localErr(`Couldn't fetch the ${st.name} stem from the local engine.`);
+    stems.push({ name: capitalize(st.name), blob: await res.blob() });
+  }
+  return { stems, source: "This computer" };
+}
+
 /* ---------------- separation ---------------- */
 let chosenFile = null;
 let currentJob = null;
@@ -284,12 +381,12 @@ function finishUi() {
 
 $("#btnSeparate").onclick = async () => {
   if (!chosenFile) return;
-  if (!navigator.onLine) return showError("You're offline. Separation needs an internet connection; the library works offline.");
+  if (settings.engine === "hf" && !navigator.onLine) return showError("You're offline. Separation needs an internet connection; the library works offline.");
   $("#sepError").classList.add("hidden");
   $("#btnSeparate").disabled = true;
   $("#progress").classList.remove("hidden");
   const started = Date.now();
-  let phase = "Connecting to Space…";
+  let phase = settings.engine === "local" ? "Connecting to this computer…" : "Connecting to Space…";
   setProgress({ title: phase, text: "", frac: null });
   finishUi._timer = setInterval(() => {
     $("#progTitle").textContent = `${phase} (${fmtTime((Date.now() - started) / 1000)})`;
@@ -297,56 +394,62 @@ $("#btnSeparate").onclick = async () => {
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
 
   try {
-    const c = await connect((msg) => setProgress({ text: msg }));
-    renderParams();
-    const { handle_file } = await loadGradio();
-    const vals = readParamValues();
-    saveParamValues();
-    const data = new Array(c.info.parameters.length).fill(null);
-    data[c.fileIdx] = handle_file(chosenFile);
-    for (const p of c.extra) data[p.idx] = vals[p.name || p.label];
+    let stems, source;
+    if (settings.engine === "local") {
+      ({ stems, source } = await runLocal(chosenFile, (p) => { phase = p; $("#progTitle").textContent = p; }));
+    } else {
+      const c = await connect((msg) => setProgress({ text: msg }));
+      renderParams();
+      const { handle_file } = await loadGradio();
+      const vals = readParamValues();
+      saveParamValues();
+      const data = new Array(c.info.parameters.length).fill(null);
+      data[c.fileIdx] = handle_file(chosenFile);
+      for (const p of c.extra) data[p.idx] = vals[p.name || p.label];
 
-    phase = "Uploading & queuing…";
-    setProgress({ text: `${chosenFile.name} → ${c.space}`, frac: null });
-    const job = c.app.submit(c.endpoint, data);
-    currentJob = job;
-    let result = null;
-    for await (const msg of job) {
-      if (currentJob !== job) return; // cancelled
-      if (msg.type === "status") {
-        if (msg.stage === "error") {
-          const m = typeof msg.message === "string" ? msg.message : (msg.message || []).map((v) => v.message).join("; ");
-          throw new Error(m || "The Space reported an error (it may be out of GPU quota or overloaded).");
+      phase = "Uploading & queuing…";
+      setProgress({ text: `${chosenFile.name} → ${c.space}`, frac: null });
+      const job = c.app.submit(c.endpoint, data);
+      currentJob = job;
+      let result = null;
+      for await (const msg of job) {
+        if (currentJob !== job) return; // cancelled
+        if (msg.type === "status") {
+          if (msg.stage === "error") {
+            const m = typeof msg.message === "string" ? msg.message : (msg.message || []).map((v) => v.message).join("; ");
+            throw new Error(m || "The Space reported an error (it may be out of GPU quota or overloaded).");
+          }
+          if (msg.stage === "pending") {
+            phase = msg.position != null && msg.position > 0 ? `In queue (#${msg.position + 1})` : "Separating…";
+            setProgress({ text: msg.eta ? `Estimated ${Math.round(msg.eta)} s` : "This usually takes 1–5 minutes per song.", frac: null });
+          }
+          if (msg.progress_data?.[0]) {
+            const pd = msg.progress_data[0];
+            const frac = pd.progress != null ? (pd.length ? pd.progress / pd.length : pd.progress) : null;
+            phase = "Separating…";
+            setProgress({ text: pd.desc || "", frac });
+          }
+          if (msg.stage === "complete") break;
+        } else if (msg.type === "data") {
+          result = msg.data;
+        } else if (msg.type === "log" && msg.log) {
+          setProgress({ text: msg.log });
         }
-        if (msg.stage === "pending") {
-          phase = msg.position != null && msg.position > 0 ? `In queue (#${msg.position + 1})` : "Separating…";
-          setProgress({ text: msg.eta ? `Estimated ${Math.round(msg.eta)} s` : "This usually takes 1–5 minutes per song.", frac: null });
-        }
-        if (msg.progress_data?.[0]) {
-          const pd = msg.progress_data[0];
-          const frac = pd.progress != null ? (pd.length ? pd.progress / pd.length : pd.progress) : null;
-          phase = "Separating…";
-          setProgress({ text: pd.desc || "", frac });
-        }
-        if (msg.stage === "complete") break;
-      } else if (msg.type === "data") {
-        result = msg.data;
-      } else if (msg.type === "log" && msg.log) {
-        setProgress({ text: msg.log });
       }
-    }
-    if (!result) throw new Error("The Space finished but returned nothing.");
+      if (!result) throw new Error("The Space finished but returned nothing.");
 
-    phase = "Downloading stems…";
-    setProgress({ text: "", frac: 0 });
-    const outputs = collectOutputs(result, c.info.returns);
-    if (!outputs.length) throw new Error("No audio came back. This Space may need different options. Check the settings above.");
-    const blobs = [];
-    for (let i = 0; i < outputs.length; i++) {
-      setProgress({ text: outputs[i].name, frac: i / outputs.length });
-      blobs.push(await fetchOutput(outputs[i].url));
+      phase = "Downloading stems…";
+      setProgress({ text: "", frac: 0 });
+      const outputs = collectOutputs(result, c.info.returns);
+      if (!outputs.length) throw new Error("No audio came back. This Space may need different options. Check the settings above.");
+      const blobs = [];
+      for (let i = 0; i < outputs.length; i++) {
+        setProgress({ text: outputs[i].name, frac: i / outputs.length });
+        blobs.push(await fetchOutput(outputs[i].url));
+      }
+      stems = outputs.map((o, i) => ({ name: o.name, blob: blobs[i] }));
+      source = c.space;
     }
-    const stems = outputs.map((o, i) => ({ name: o.name, blob: blobs[i] }));
     if (settings.keepOriginal) stems.push({ name: "Original mix", blob: chosenFile, original: true });
     if (settings.compress) {
       phase = "Shrinking to MP3…";
@@ -354,7 +457,7 @@ $("#btnSeparate").onclick = async () => {
     }
     phase = "Saving…";
     setProgress({ text: "Saving to library…", frac: 1 });
-    const id = await createTrack({ title: chosenFile.name.replace(/\.[^.]+$/, ""), space: c.space, stems });
+    const id = await createTrack({ title: chosenFile.name.replace(/\.[^.]+$/, ""), space: source, stems });
     finishUi();
     toast("Done! Saved to your library");
     resetChooser();
@@ -381,6 +484,7 @@ function resetChooser() {
 
 function friendlyError(err) {
   const m = String(err?.message || err);
+  if (err?.local) return m;
   if (/quota|ZeroGPU|exceeded your GPU/i.test(m))
     return m + "\n\nTip: add a free Hugging Face token in Settings for more GPU time, or use your own Space (see README).";
   if (/could not resolve|not found|404|Could not get API/i.test(m))
@@ -1618,7 +1722,21 @@ $("#btnShrinkAll").onclick = async () => {
 };
 
 /* ---------------- settings view ---------------- */
+function showEngine(e) {
+  document.querySelectorAll("#engineSeg button").forEach((b) => b.classList.toggle("on", b.dataset.e === e));
+  $("#localSettings").classList.toggle("hidden", e !== "local");
+  $("#hfSettings").classList.toggle("hidden", e !== "hf");
+}
+document.querySelectorAll("#engineSeg button").forEach((b) => (b.onclick = () => {
+  settings.engine = b.dataset.e;
+  showEngine(b.dataset.e);
+  $("#settingsMsg").textContent = "";
+  renderParams();
+}));
+
 function fillSettings() {
+  showEngine(settings.engine);
+  $("#localUrl").value = settings.localUrl;
   $("#spaceInput").value = settings.space;
   $("#tokenInput").value = settings.token;
   $("#keepOriginal").checked = settings.keepOriginal;
@@ -1634,6 +1752,22 @@ function fillSettings() {
 }
 
 $("#btnSaveSettings").onclick = async () => {
+  settings.keepOriginal = $("#keepOriginal").checked;
+  settings.compress = $("#compressStems").checked;
+  if (settings.engine === "local") {
+    let u = $("#localUrl").value.trim() || "http://127.0.0.1:8765";
+    if (!/^https?:\/\//.test(u)) u = "http://" + u;
+    settings.localUrl = u;
+    const msg = $("#settingsMsg");
+    msg.style.color = ""; msg.textContent = "Connecting…";
+    try {
+      const info = await localInfo();
+      msg.style.color = "var(--ok)";
+      msg.textContent = `✓ Connected to the local engine (${String(info.device).toUpperCase()}). Models: ${info.models.map((m) => m.id).join(", ")}`;
+    } catch (e) { msg.style.color = "var(--danger)"; msg.textContent = "✗ " + e.message; }
+    renderParams();
+    return;
+  }
   let space = $("#spaceInput").value.trim();
   // accept full URLs: https://huggingface.co/spaces/owner/name or https://owner-name.hf.space
   const m = space.match(/huggingface\.co\/spaces\/([^/]+\/[^/?#]+)/);
@@ -1692,7 +1826,7 @@ addEventListener("online", updateNet);
 addEventListener("offline", updateNet);
 updateNet();
 
-const APP_VERSION = "9";
+const APP_VERSION = "10";
 $("#appVersion").textContent = `StemSplit version ${APP_VERSION}`;
 if ("serviceWorker" in navigator) {
   const hadController = !!navigator.serviceWorker.controller;
@@ -1711,4 +1845,5 @@ document.addEventListener("visibilitychange", async () => {
 
 renderParams();
 // Warm up the connection in the background so options (model choice etc.) appear.
-if (navigator.onLine) connect().then(renderParams).catch(() => {});
+if (settings.engine === "local") localInfo().then(renderParams).catch(() => {});
+else if (navigator.onLine) connect().then(renderParams).catch(() => {});

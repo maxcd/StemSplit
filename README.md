@@ -45,6 +45,10 @@ The app works with any Gradio Space that takes an audio file and returns audio. 
 
 Free CPU takes roughly 3–8 minutes for a 4-minute song. For speed you can switch the Space's hardware to a paid GPU, or (with HF PRO) to ZeroGPU after adding `import spaces` and an `@spaces.GPU` decorator on `separate()`.
 
+## Separating on your own computer
+
+In Settings you can switch the engine from Hugging Face to **This computer**. Then the separation runs on your PC with no upload and no daily limit. Setup instructions (Linux) are in `local-engine/README.md`.
+
 ## Notes & limits
 
 - Keep the app open while a song is processing, because phones suspend web apps in the background. The app holds the screen awake where the browser supports it.
